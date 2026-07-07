@@ -65,7 +65,7 @@ def estimate_loss(model, data, cfg):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--preset", default="full", choices=["tiny", "full"])
+    ap.add_argument("--preset", default="full", choices=["tiny", "tiny-loop", "full"])
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--init-from", default="", help="이 체크포인트 가중치로 시작(재개 아님)")
     args = ap.parse_args()
@@ -103,7 +103,11 @@ def main():
         print(f"재개: step {start_step}부터 (지금까지 best_val={best_val:.3f})")
     elif args.init_from:
         ck = torch.load(args.init_from, map_location=cfg.device)
-        model.load_state_dict(ck["model"])
+        # strict=False: 기분 벡터(FiLM) 등 새 기능의 파라미터가 체크포인트에
+        # 없어도 로드된다 (새 파라미터는 항등 초기화 상태로 시작)
+        missing, unexpected = model.load_state_dict(ck["model"], strict=False)
+        if missing or unexpected:
+            print(f"  strict=False 로드: missing={missing}, unexpected={unexpected}")
         print(f"가중치 초기화: {args.init_from}")
 
     # mixed precision: GPU에서 fp16/bf16으로 계산해 속도·메모리 이득

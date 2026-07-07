@@ -44,7 +44,12 @@ SPLIT_PATTERN = re.compile(r" ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+")
 
 # 대화 형식을 표현하기 위한 특수 토큰. 일반 텍스트에서는 절대 만들어지지
 # 않도록 merge로 생성하지 않고 사전 끝에 별도 ID로 붙인다.
-SPECIAL_TOKENS = ["<|endoftext|>", "<|user|>", "<|assistant|>", "<|end|>"]
+# 뒤의 8개는 "마음 유사 기제"용 + 예약분 — vocab을 나중에 또 수술하지 않도록
+# 미리 자리를 잡아 둔다. (vocab 16392 = 256 바이트 + 16124 merge + 특수 12개.
+# 예전 16384/특수 4개 설정과 merge 수가 같아, 같은 코퍼스면 같은 merge를 배운다)
+SPECIAL_TOKENS = ["<|endoftext|>", "<|user|>", "<|assistant|>", "<|end|>",
+                  "<|pause|>", "<|thought|>", "<|mood|>", "<|sys|>",
+                  "<|res0|>", "<|res1|>", "<|res2|>", "<|res3|>"]
 
 
 class BPETokenizer:
@@ -168,6 +173,10 @@ class BPETokenizer:
     def encode_special(self, token: str) -> int:
         """특수 토큰 문자열의 ID를 돌려준다. (예: '<|user|>')"""
         return self.special_tokens[token]
+
+    def has_special(self, token: str) -> bool:
+        """이 토크나이저가 해당 특수 토큰을 갖고 있는지 (구버전 사전 호환용)."""
+        return token in self.special_tokens
 
     def decode(self, ids: list[int]) -> str:
         """토큰 ID 리스트 -> 텍스트. 토큰별 바이트를 이어붙인 뒤 UTF-8 해석."""

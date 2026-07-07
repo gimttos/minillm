@@ -8,28 +8,46 @@ pretrain.py와 거의 같지만 세 가지가 다르다:
 
 파인튜닝이라 스텝 수도 학습률도 작다 (기존 지식을 망가뜨리지 않도록).
 
+마음 유사 기제의 학습도 여기서 한다:
+  --mood-dim D : 기분 벡터. 배치의 절반을 2-pass로 학습 — 먼저 문맥의
+                 은닉 평균을 기분 관측으로 압축하고, 그 기분을 주입한 채
+                 답변을 학습한다. "문맥의 압축된 느낌에 조건화하는 법"을
+                 배우는 것. 나머지 절반은 mood 없이 학습해 첫 턴(기분이
+                 아직 없는 상태)에도 강건하게 만든다.
+  --latent K   : Coconut 잠재 사고. 답변 첫 토큰 전에 은닉 상태를 말 없이
+                 K번 되먹이는 경로를 커리큘럼(초반 30% -> 후반 70% 확률)으로
+                 학습한다. K=0 배치를 항상 섞어 잠재 스텝 없는 추론도
+                 유효하게 유지한다.
+검증 분할(마지막 --val-frac)을 떼어 주기적으로 val loss를 보고,
+가장 좋았던 시점의 가중치를 저장한다.
+
 사용법:
     python -m train.sft --init checkpoints/ckpt_best.pt --data data/bin/sft.npz
+    python -m train.sft --init ... --mood-dim 64                 # 기분 벡터
+    python -m train.sft --init ... --latent 2                    # 잠재 사고
+    python -m train.sft --init ... --n-pause 4                   # pause 데이터로 SFT 시 기록
 """
 
 import argparse
 import math
+import random
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from model.gpt import GPT, ModelConfig
 from train.pretrain import _save
 
 
-def make_batch(examples, boundaries, ids, mask, block, batch_size, pad_id, device):
-    """무작위 예시 batch_size개를 골라 (x, y, m) 배치를 만든다.
+def make_batch(picks, boundaries, ids, mask, block, pad_id, device):
+    """예시 인덱스 picks로 (x, y, m) 배치를 만든다.
     각 예시는 block+1 길이로 패딩/절단한다. 패딩 위치의 target은 -1(무시)."""
+    batch_size = len(picks)
     x = np.full((batch_size, block), pad_id, dtype=np.int64)
     y = np.full((batch_size, block), -1, dtype=np.int64)
     m = np.zeros((batch_size, block), dtype=np.float32)
-    picks = np.random.randint(0, len(boundaries) - 1, size=batch_size)
     for row, p in enumerate(picks):
         s, e = boundaries[p], boundaries[p + 1]
         seg_ids = ids[s:e].astype(np.int64)
@@ -42,6 +60,143 @@ def make_batch(examples, boundaries, ids, mask, block, batch_size, pad_id, devic
     return to(x), to(y), to(m)
 
 
+# ---------------------------------------------------------------------------
+# 기분 벡터: 2-pass 학습
+# ---------------------------------------------------------------------------
+def mood_from_context(model, x, y, m, h=None):
+    """1-pass: 문맥(사용자 질문 부분)의 은닉 평균을 기분 관측으로 압축한다.
+    은닉 계산은 no_grad(비쌈 + 여기로 역전파할 필요 없음)지만, 읽기 헤드
+    mood_read에는 그래디언트가 흐르게 해 "무엇을 기분으로 읽을지"를 배운다.
+    h를 주면(역피드백과 1-pass 공유) 다시 계산하지 않는다."""
+    if h is None:
+        with torch.no_grad():
+            h = model.hidden_states(x)                 # (B, T, C)
+    sel = ((y != -1) & (m == 0)).float().unsqueeze(-1)  # 실제 토큰 중 답변이 아닌 곳
+    pool = (h * sel).sum(1) / sel.sum(1).clamp(min=1)   # (B, C)
+    return torch.tanh(model.mood_read(pool.detach()))   # (B, mood_dim)
+
+
+# ---------------------------------------------------------------------------
+# 잠재 사고(Coconut): 배치 구성과 loss
+# ---------------------------------------------------------------------------
+def make_latent_batch(picks, boundaries, ids, mask, a_id, pad_id, device):
+    """예시들을 <|assistant|> 직후에서 갈라 (접두부, 답변부) 배치로 만든다.
+
+    접두부는 왼쪽 패딩(모든 행의 <|assistant|>가 마지막 열에 오도록),
+    답변부는 오른쪽 패딩. 이렇게 정렬해야 잠재 스텝과 답변부가 배치 전체에서
+    같은 열에서 시작해 캐시/마스크를 한 번에 처리할 수 있다.
+
+    왼쪽 패딩이 RoPE를 깨지 않는 이유: RoPE는 상대 거리만 보는데, 한 행 안의
+    실제 토큰들은 여전히 연속된 열에 있어 상대 거리가 전부 보존된다.
+    패딩 열은 attn_mask로 어텐션에서 제외한다.
+    """
+    rows = []
+    for p in picks:
+        s, e = boundaries[p], boundaries[p + 1]
+        seg_ids = ids[s:e].astype(np.int64)
+        seg_mask = mask[s:e].astype(np.float32)
+        a_pos = np.where(seg_ids == a_id)[0]
+        if len(a_pos) == 0:
+            continue  # 형식이 깨진 예시는 건너뜀
+        rows.append((seg_ids, seg_mask, int(a_pos[0]) + 1))  # 접두부는 <|assistant|> 포함
+
+    if not rows:
+        return None
+    B = len(rows)
+    P = max(r[2] for r in rows)                       # 접두부 길이 (왼쪽 패딩 후)
+    S = max(len(r[0]) - r[2] - 1 for r in rows)       # 답변부 입력 길이
+    prefix = np.full((B, P), pad_id, dtype=np.int64)
+    pad_len = np.zeros(B, dtype=np.int64)
+    suffix_x = np.full((B, S), pad_id, dtype=np.int64)
+    suffix_y = np.full((B, S), -1, dtype=np.int64)
+    suffix_m = np.zeros((B, S), dtype=np.float32)
+    first_y = np.zeros(B, dtype=np.int64)             # 마지막 잠재 스텝의 정답 = 답변 첫 토큰
+
+    for i, (seg_ids, seg_mask, split) in enumerate(rows):
+        pl = P - split
+        pad_len[i] = pl
+        prefix[i, pl:] = seg_ids[:split]
+        first_y[i] = seg_ids[split]
+        sx = seg_ids[split:-1]                        # 각 위치 t가 t+1을 맞힌다
+        n = len(sx)
+        suffix_x[i, :n] = sx
+        suffix_y[i, :n] = seg_ids[split + 1:]
+        suffix_m[i, :n] = seg_mask[split + 1:]
+
+    to = lambda a: torch.from_numpy(a).to(device)
+    return to(prefix), to(pad_len), to(suffix_x), to(suffix_y), to(suffix_m), to(first_y)
+
+
+def latent_loss(model, prefix, pad_len, suffix_x, suffix_y, suffix_m, first_y, k):
+    """잠재 사고 경로: 접두부(캐시 유지) -> 잠재 k스텝 -> 답변부(직사각 마스크).
+
+    추론(generate)과 똑같은 순서로 처리하되, 접두부와 답변부는 병렬로
+    처리해 학습 속도를 지킨다. loss = 답변 첫 토큰(마지막 잠재 스텝이 맞힘)
+    + 답변부 각 토큰. attn_mask는 True=참조 허용.
+    """
+    B, P = prefix.shape
+    S = suffix_x.size(1)
+    dev = prefix.device
+    cols = torch.arange(P, device=dev)
+    real = cols[None, :] >= pad_len[:, None]          # (B, P) 패딩이 아닌 열
+
+    # 1) 접두부: causal + 패딩 차단, KV 캐시에 쌓는다 (그래디언트 유지)
+    pre_mask = (cols[None, None, None, :] <= cols[None, None, :, None]) \
+        & real[:, None, None, :]
+    # 패딩 열의 쿼리는 참조할 곳이 하나도 없으면 softmax가 NaN이 되어 배치
+    # 전체로 번진다 — 최소한 자기 자신은 보게 한다 (출력은 어차피 버려짐)
+    diag = torch.eye(P, dtype=torch.bool, device=dev)
+    pre_mask = pre_mask | diag[None, None, :, :]
+    caches = model.new_caches()
+    h = model.run_from_pos(model.tok_emb(prefix), 0, caches, attn_mask=pre_mask)
+    h_last = h[:, -1, :]                              # <|assistant|> 위치의 은닉
+
+    # 2) 잠재 스텝: 은닉을 말 없이 자기 입력으로 k번 되먹인다
+    for t in range(k):
+        lat_mask = torch.ones(B, 1, 1, P + t + 1, dtype=torch.bool, device=dev)
+        lat_mask[:, 0, 0, :P] = real
+        x_lat = model.latent_proj(h_last).unsqueeze(1)
+        h_last = model.run_from_pos(x_lat, P + t, caches, attn_mask=lat_mask)[:, -1, :]
+
+    # 3) 답변 첫 토큰: 마지막 잠재 스텝의 은닉이 맞혀야 한다 (항상 학습 대상)
+    loss_first = F.cross_entropy(model.lm_head(h_last), first_y, reduction="sum")
+
+    # 4) 답변부: 직사각 causal — 전역 위치 P+k+i는 j <= P+k+i까지 참조 가능
+    cols_all = torch.arange(P + k + S, device=dev)
+    rows_q = torch.arange(S, device=dev)
+    suf_mask = (cols_all[None, None, None, :] <= (P + k + rows_q)[None, None, :, None]) \
+        .expand(B, 1, S, P + k + S).clone()
+    suf_mask[:, 0, :, :P] &= real[:, None, :]
+    h_suf = model.run_from_pos(model.tok_emb(suffix_x), P + k, caches, attn_mask=suf_mask)
+    logits = model.lm_head(h_suf)
+    ce = F.cross_entropy(logits.reshape(-1, logits.size(-1)), suffix_y.reshape(-1),
+                         ignore_index=-1, reduction="none")
+    msum = suffix_m.reshape(-1)
+    return (loss_first + (ce * msum).sum()) / (B + msum.sum()).clamp(min=1)
+
+
+# ---------------------------------------------------------------------------
+# 검증
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def estimate_val(model, val_idx, boundaries, ids, mask, block, batch_size, pad_id,
+                 device, use_mood=False):
+    """검증 예시 전체의 masked loss 평균. use_mood면 2-pass(기분 주입)로 잰다.
+    역피드백은 켜져 있으면(model.cfg.feedback) 항상 반영 — 추론과 같은 조건."""
+    model.eval()
+    losses = []
+    for i in range(0, len(val_idx), batch_size):
+        picks = val_idx[i:i + batch_size]
+        x, y, m = make_batch(picks, boundaries, ids, mask, block, pad_id, device)
+        h = model.hidden_states(x) if (use_mood or model.cfg.feedback) else None
+        mood = mood_from_context(model, x, y, m, h=h) if use_mood else None
+        fh = h if model.cfg.feedback else None
+        _, loss = model(x, y, loss_mask=m, mood=mood, feedback_h=fh)
+        losses.append(loss.item())
+    model.train()
+    return sum(losses) / max(len(losses), 1)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--init", required=True, help="사전학습 체크포인트")
@@ -52,23 +207,63 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="bfloat16")
+    # --- 마음 유사 기제 ---
+    ap.add_argument("--mood-dim", type=int, default=0, help="기분 벡터 차원 (0=off)")
+    ap.add_argument("--latent", type=int, default=0, help="잠재 사고 스텝 수 (0=off)")
+    ap.add_argument("--n-pause", type=int, default=0,
+                    help="데이터에 넣은 pause 수 — 체크포인트에 기록해 chat.py가 따라 하게 한다")
+    ap.add_argument("--feedback", action="store_true",
+                    help="역피드백: 직전 토큰의 최종 은닉을 다음 토큰 입력에 방송 (2-pass)")
+    ap.add_argument("--conf", action="store_true",
+                    help="확신도 헤드: '다음 토큰을 맞힐 것인가'를 스스로 예측 (메타인지)")
+    ap.add_argument("--tokenizer", default="tokenizer/tokenizer.json",
+                    help="--latent 사용 시 <|assistant|> 위치를 찾는 데 필요")
+    ap.add_argument("--val-frac", type=float, default=0.02)
+    ap.add_argument("--eval-interval", type=int, default=200)
     args = ap.parse_args()
 
     torch.manual_seed(1337)
     np.random.seed(1337)
+    random.seed(1337)
 
     ck = torch.load(args.init, map_location=args.device)
     cfg = ModelConfig(**ck["model_config"])
+    # 기능 플래그를 켜서 모델을 만든다 — 새 파라미터(FiLM 등)는 항등 초기화라
+    # 켜는 순간에는 동작이 변하지 않고, 학습으로만 활성화된다
+    if args.mood_dim:
+        cfg.mood_dim = args.mood_dim
+    if args.latent:
+        cfg.n_latent = args.latent
+    if args.n_pause:
+        cfg.n_pause = args.n_pause
+    if args.feedback:
+        cfg.feedback = True
+    if args.conf:
+        cfg.conf_head = True
     model = GPT(cfg).to(args.device)
-    model.load_state_dict(ck["model"])
+    missing, unexpected = model.load_state_dict(ck["model"], strict=False)
+    if missing or unexpected:
+        print(f"strict=False 로드: missing={missing}, unexpected={unexpected}")
     print(f"사전학습 가중치 로드: {args.init} ({model.num_params() / 1e6:.1f}M)")
+
+    # SFT에서는 loop 반복 횟수를 최대값으로 고정한다 — 잠재 사고 경로가
+    # 여러 forward에 걸쳐 같은 캐시를 쓰므로 실행 구조가 일정해야 한다
+    model._loop_override = cfg.n_loop
 
     d = np.load(args.data)
     ids, mask, boundaries = d["ids"], d["mask"], d["boundaries"]
     n_examples = len(boundaries) - 1
-    steps = int(n_examples * args.epochs / args.batch_size)
+    n_val = max(int(n_examples * args.val_frac), 1)
+    train_idx = np.arange(0, n_examples - n_val)
+    val_idx = np.arange(n_examples - n_val, n_examples)
+    steps = int(len(train_idx) * args.epochs / args.batch_size)
     warmup = max(steps // 20, 10)
-    print(f"{n_examples:,}개 예시, {steps:,} 스텝 예정")
+    print(f"{len(train_idx):,}개 학습 / {n_val:,}개 검증 예시, {steps:,} 스텝 예정")
+
+    a_id = None
+    if args.latent:
+        from tokenizer.bpe import BPETokenizer
+        a_id = BPETokenizer.load(args.tokenizer).encode_special("<|assistant|>")
 
     pad_id = int(ids[0])  # 아무 토큰이나 무방 — target=-1이라 loss에 안 잡힘
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
@@ -78,6 +273,8 @@ def main():
     amp_dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     scaler = torch.amp.GradScaler(enabled=(use_amp and args.dtype == "float16"))
 
+    best_val = float("inf")
+    saved_best = False
     model.train()
     for step in range(steps):
         # 코사인 LR (워밍업 포함)
@@ -89,13 +286,42 @@ def main():
         for g in opt.param_groups:
             g["lr"] = lr
 
-        x, y, m = make_batch(n_examples, boundaries, ids, mask,
-                             cfg.max_seq_len, args.batch_size, pad_id, args.device)
+        picks = np.random.choice(train_idx, size=args.batch_size, replace=False)
+
+        # --- 학습 경로 선택 ---
+        progress = step / max(steps, 1)
+        p_latent = 0.3 if progress < 1 / 3 else 0.7  # 잠재 커리큘럼: 점점 자주
+        path = "plain"
+        if args.latent and random.random() < p_latent:
+            path = "latent"
+        elif cfg.mood_dim and random.random() < 0.5:
+            path = "mood"
+
+        def compute_loss():
+            if path == "latent":
+                # 역피드백은 이 경로에 얹지 않는다 — 잠재 스텝의 입력 자체가
+                # 이미 전대역 피드백이라 중복이다
+                batch = make_latent_batch(picks, boundaries, ids, mask,
+                                          a_id, pad_id, args.device)
+                if batch is not None:
+                    return latent_loss(model, *batch, k=args.latent)
+            x, y, m = make_batch(picks, boundaries, ids, mask,
+                                 cfg.max_seq_len, pad_id, args.device)
+            # 1-pass 은닉은 기분과 역피드백이 공유한다 — 같이 켜도 비용 동일
+            h = None
+            if cfg.feedback or path == "mood":
+                with torch.no_grad():
+                    h = model.hidden_states(x)
+            mood = mood_from_context(model, x, y, m, h=h) if path == "mood" else None
+            fh = h if cfg.feedback else None
+            _, loss = model(x, y, loss_mask=m, mood=mood, feedback_h=fh)
+            return loss
+
         if use_amp:
             with torch.autocast(device_type="cuda", dtype=amp_dtype):
-                _, loss = model(x, y, loss_mask=m)
+                loss = compute_loss()
         else:
-            _, loss = model(x, y, loss_mask=m)
+            loss = compute_loss()
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -104,12 +330,33 @@ def main():
         opt.zero_grad(set_to_none=True)
 
         if step % 50 == 0:
-            print(f"step {step:>5}/{steps} | loss {loss.item():.3f} | lr {lr:.2e}")
+            extra = ""
+            if cfg.conf_head and getattr(model, "_last_conf_loss", None) is not None:
+                extra = f" | conf {model._last_conf_loss.item():.3f}"
+            print(f"step {step:>5}/{steps} | loss {loss.item():.3f} | lr {lr:.2e} | {path}{extra}")
 
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    _save(args.out, model, opt, steps - 1, 0.0,
-          type("C", (), {"model": cfg})())  # _save는 cfg.model만 참조
-    print(f"SFT 완료 -> {args.out}")
+        if step > 0 and step % args.eval_interval == 0:
+            vloss = estimate_val(model, val_idx, boundaries, ids, mask,
+                                 cfg.max_seq_len, args.batch_size, pad_id, args.device)
+            line = f"  >> val loss {vloss:.3f} (best {best_val:.3f})"
+            if cfg.mood_dim:
+                vm = estimate_val(model, val_idx, boundaries, ids, mask,
+                                  cfg.max_seq_len, args.batch_size, pad_id,
+                                  args.device, use_mood=True)
+                line += f" | mood 주입 시 {vm:.3f}"
+            print(line)
+            if vloss < best_val:
+                best_val = vloss
+                Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+                _save(args.out, model, opt, step, best_val,
+                      type("C", (), {"model": cfg})())  # _save는 cfg.model만 참조
+                saved_best = True
+
+    if not saved_best:
+        Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+        _save(args.out, model, opt, steps - 1, best_val,
+              type("C", (), {"model": cfg})())
+    print(f"SFT 완료 -> {args.out} (best val {best_val:.3f})")
 
 
 if __name__ == "__main__":

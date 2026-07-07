@@ -58,11 +58,14 @@ def main():
     ap.add_argument("--tokenizer", default="tokenizer/tokenizer.json")
     ap.add_argument("--out", default="data/bin/sft.npz")
     ap.add_argument("--max-tokens", type=int, default=512, help="예시 최대 토큰(모델 문맥)")
+    ap.add_argument("--n-pause", type=int, default=0,
+                    help="답변 앞에 강제 삽입할 <|pause|> 수 — 말하기 전 '생각할 시간'")
     args = ap.parse_args()
 
     tok = BPETokenizer.load(args.tokenizer)
     U, A, END, EOT = (tok.encode_special(t) for t in
                       ("<|user|>", "<|assistant|>", "<|end|>", "<|endoftext|>"))
+    pauses = [tok.encode_special("<|pause|>")] * args.n_pause
 
     pairs = load_pairs()
     print(f"{len(pairs):,}개 대화 쌍 로드. 토큰화 중...")
@@ -75,8 +78,10 @@ def main():
         q_ids = tok.encode(q)
         a_ids = tok.encode(a)
         # 템플릿 조립. mask: 답변 토큰과 그 끝의 <|end|>만 1 (그걸 생성해야 하므로)
-        ids = [U] + q_ids + [END, A] + a_ids + [END, EOT]
-        mask = ([0] * (1 + len(q_ids) + 2)) + ([1] * (len(a_ids) + 1)) + [0]
+        # pause는 mask 0 — 모델이 pause를 "출력하도록" 배우는 게 아니라,
+        # 강제로 주어진 그 자리의 연산만 활용하게 한다 (chat.py도 강제 삽입)
+        ids = [U] + q_ids + [END, A] + pauses + a_ids + [END, EOT]
+        mask = ([0] * (1 + len(q_ids) + 2 + len(pauses))) + ([1] * (len(a_ids) + 1)) + [0]
         assert len(ids) == len(mask)
         if len(ids) > args.max_tokens:
             continue

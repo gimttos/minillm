@@ -21,9 +21,30 @@ GPU(Kaggle/Colab), 대화는 내 노트북 CPU에서 돌린다. 총비용 ₩0.
 
 ## 모델 사양
 
-Decoder-only Transformer (미니 Llama): vocab 16,384 · d_model 512 ·
+Decoder-only Transformer (미니 Llama): vocab 16,392 · d_model 512 ·
 8 layers · 8 heads · SwiGLU · RoPE · RMSNorm · context 512 → 약 30M 파라미터
 (fp32 체크포인트 ≈ 120MB).
+
+## 마음 유사 기제 (선택 기능, 전부 기본 off)
+
+사람 마음의 작동 방식에서 빌려 온 네 가지 잠재 기제를 `ModelConfig` 플래그로
+넣었다. Anthropic의 글로벌 워크스페이스(J-space) 연구에서 영감을 받은 실험이다.
+
+| 기제 | 무엇인가 | 켜는 법 |
+|---|---|---|
+| **loop** (재귀 깊이) | 중간 블록들을 같은 가중치로 반복 통과 — 파라미터 추가 없이 "한 번 더 생각할 시간" | full 프리셋에 포함 (사전학습) |
+| **pause** | 답변 앞에 `<\|pause\|>` 토큰을 강제 삽입 — 말하기 전 연산 버퍼 | `prepare_sft --n-pause 4` + `sft --n-pause 4` |
+| **mood** (기분 벡터) | 턴 사이에 지속·감쇠(EMA)하는 상태 벡터를 각 블록에 FiLM으로 주입 — "객관적인 기분 상태" | `sft --mood-dim 64`, 대화 시 `--mood-file`로 세션 간 유지 |
+| **latent** (잠재 사고) | 답변 첫 토큰 전에 은닉 상태를 말 없이 k번 되먹임(Coconut) — "속말 없는 개념적 사고" | `sft --latent 2` |
+| **feedback** (역피드백) | 직전 토큰의 최종 은닉을 다음 토큰의 입력단에 방송 — "내가 방금 무엇을 생각했는지 알고 시작" (2-pass 근사로 병렬 학습 유지) | `sft --feedback` |
+| **conf** (메타인지) | "다음 토큰을 맞힐 것인가"를 스스로 예측하는 확신도 헤드. 추론에서 확신이 낮으면 잠재 스텝을 더 밟는 적응적 사고 | `sft --conf`, 대화 시 `--adaptive-latent 0.5` |
+
+체크포인트가 자기 설정(`model_config`)을 내장하므로 `chat.py`는 자동으로
+올바르게 동작한다. 핵심 실험 둘: **latent vs pause** — 연속적인 잠재 사고가
+이산적인 필러 "속말"보다 나은지를 같은 연산량(k)에서 val loss로 비교,
+그리고 **calibration** (`tools/eval_conf.py`) — 확신도 0.9 구간에서 실제로
+~90%를 맞히면 기능적 메타인지가 성립한 것이다.
+정확성은 `python -m tests.test_kv_loop`가 지킨다 (캐시 증분 ≡ 일괄 처리).
 
 ## 빠른 시작
 

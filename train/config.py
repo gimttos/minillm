@@ -46,15 +46,43 @@ class TrainConfig:
 
 def get_config(preset: str) -> TrainConfig:
     if preset == "full":
-        return TrainConfig()
+        # loop(재귀 깊이)를 처음부터 켜고 학습한다: 중간 4블록(2~5)을 그룹째
+        # 2회 통과 -> 실효 깊이 12, 연산 1.5배. 파라미터 수는 그대로.
+        # vocab 16392 = 특수 토큰 8개 예약분 포함 (tokenizer/bpe.py 참조).
+        return TrainConfig(
+            model=ModelConfig(
+                vocab_size=16392,
+                loop_start=2, loop_end=6, n_loop=2,
+            ),
+            # loop로 활성값 메모리가 ~1.5배 -> 배치를 줄이고 accum으로 보전 (유효 480 유지)
+            batch_size=16, grad_accum=30,
+            # 학습 중 반복 횟수를 {1,2}에서 확률 샘플하므로 그래프가 매번 달라져
+            # torch.compile과 상성이 나쁘다 — loop 학습에서는 끈다
+            compile=False,
+        )
 
     if preset == "tiny":
         # 로컬 CPU에서 수 분 내로 도는 초소형 설정. 목적은 성능이 아니라
         # "코드가 학습되긴 하는가"를 오버핏으로 확인하는 것.
         return TrainConfig(
             model=ModelConfig(
-                vocab_size=16384, d_model=128, n_layers=2, n_heads=4,
+                vocab_size=16392, d_model=128, n_layers=2, n_heads=4,
                 ffn_hidden=352, max_seq_len=128,
+            ),
+            batch_size=8, grad_accum=1, max_steps=200, warmup_steps=20,
+            eval_interval=50, eval_iters=20, log_interval=10, save_interval=100,
+            device="cpu", dtype="float32", compile=False,
+            learning_rate=1e-3,
+        )
+
+    if preset == "tiny-loop":
+        # loop 경로의 로컬 검증용: 4층 중 가운데 2층(1~2)을 2회 반복.
+        # 2층짜리 tiny로는 loop가 의미 있게 검증되지 않아 층을 4로 늘렸다.
+        return TrainConfig(
+            model=ModelConfig(
+                vocab_size=16392, d_model=128, n_layers=4, n_heads=4,
+                ffn_hidden=352, max_seq_len=128,
+                loop_start=1, loop_end=3, n_loop=2,
             ),
             batch_size=8, grad_accum=1, max_steps=200, warmup_steps=20,
             eval_interval=50, eval_iters=20, log_interval=10, save_interval=100,

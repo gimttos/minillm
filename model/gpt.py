@@ -11,11 +11,21 @@
 
 이 파일이 곧 모델의 전부다. 학습(pretrain.py)도 대화(chat.py)도
 전부 이 클래스의 forward를 부르는 것뿐이다.
+
+마음 유사 기제 (전부 ModelConfig 플래그, 기본 off)
+=================================================
+- loop  : 중간 블록들을 같은 가중치로 여러 번 통과 — 파라미터를 늘리지
+          않고 "한 번 더 생각할 시간"을 준다. (재귀 깊이)
+- mood  : 턴 사이에 지속·감쇠하는 작은 상태 벡터를 각 블록에 FiLM
+          (scale/shift)으로 주입 — "객관적인 기분 상태"의 구현.
+- latent: 답변 첫 토큰을 뱉기 전에 은닉 상태를 말 없이 k번 자기 입력으로
+          되먹인다(Coconut) — "속말 없는 개념적 사고".
 """
 
 from __future__ import annotations
 
 import math
+import random
 from dataclasses import dataclass
 
 import torch
@@ -33,6 +43,16 @@ class ModelConfig:
     max_seq_len: int = 512    # 한 번에 볼 수 있는 최대 토큰 수 (문맥 길이)
     rope_theta: float = 10000.0
     dropout: float = 0.0      # 데이터가 많으면 0이 보통 (과적합 걱정 없음)
+
+    # --- 마음 유사 기제 (기본값 off — 예전 체크포인트는 그대로 로드된다) ---
+    loop_start: int = 0       # blocks[loop_start:loop_end]를 하나의 그룹으로
+    loop_end: int = 0         # n_loop번 반복 통과시킨다 (가중치 공유)
+    n_loop: int = 1
+    mood_dim: int = 0         # 기분 벡터 차원 (0 = 없음)
+    n_latent: int = 0         # 답변 전 잠재 사고(Coconut) 스텝 수
+    n_pause: int = 0          # 답변 앞 강제 <|pause|> 수 (데이터 레벨 — chat.py가 참조)
+    feedback: bool = False    # 직전 토큰의 최종 은닉 -> 다음 토큰 입력 (역피드백)
+    conf_head: bool = False   # "다음 토큰을 맞힐 것인가" 확신도 헤드 (메타인지)
 
 
 class RMSNorm(nn.Module):
@@ -93,7 +113,7 @@ class Attention(nn.Module):
         self.wo = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
         self.dropout = cfg.dropout
 
-    def forward(self, x, rope, kv_cache=None):
+    def forward(self, x, rope, kv_cache=None, attn_mask=None):
         B, T, C = x.shape
         q, k, v = self.wqkv(x).split(C, dim=2)
         # (B, T, C) -> (B, n_heads, T, head_dim) : 헤드별로 독립 어텐션
@@ -115,9 +135,12 @@ class Attention(nn.Module):
         # 어텐션 본체: softmax(q·k / sqrt(d)) · v  (PyTorch 내장 고속 구현 사용)
         # is_causal은 q와 k 길이가 같을 때(학습)만. 생성 시(q 길이 1)는
         # 캐시의 과거 토큰 전부를 봐도 되므로 마스크가 필요 없다.
+        # attn_mask(True=참조 허용)는 잠재 사고 SFT처럼 접두부를 캐시에 두고
+        # 접미부를 병렬 처리할 때(q 길이 ≠ k 길이) 직사각 causal을 직접 준다.
         y = F.scaled_dot_product_attention(
             q, k, v,
-            is_causal=(q.size(2) == k.size(2)),
+            attn_mask=attn_mask,
+            is_causal=(attn_mask is None and q.size(2) == k.size(2)),
             dropout_p=self.dropout if self.training else 0.0,
         )
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # 헤드 합치기
@@ -149,10 +172,20 @@ class Block(nn.Module):
         self.attn = Attention(cfg)
         self.ffn_norm = RMSNorm(cfg.d_model)
         self.ffn = SwiGLU(cfg)
+        if cfg.mood_dim > 0:
+            # 기분 벡터 -> scale/shift (FiLM). 제로 초기화(GPT.__init__에서)라
+            # 학습 전에는 완전한 항등이어서 기존 체크포인트와 호환된다.
+            self.mood_film = nn.Linear(cfg.mood_dim, 2 * cfg.d_model)
 
-    def forward(self, x, rope, kv_cache=None):
+    def forward(self, x, rope, kv_cache=None, mood=None, attn_mask=None):
         # residual 연결(x + ...) 덕분에 그래디언트가 깊은 층까지 잘 흐른다
-        x = x + self.attn(self.attn_norm(x), rope, kv_cache)
+        h = self.attn_norm(x)
+        if mood is not None:
+            # 기분이 어텐션 입력의 방향/크기를 살짝 비튼다 — residual 자체는
+            # 건드리지 않으므로 상태가 이상해도 모델이 망가지지는 않는다
+            scale, shift = self.mood_film(mood).chunk(2, dim=-1)
+            h = h * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+        x = x + self.attn(h, rope, kv_cache, attn_mask)
         x = x + self.ffn(self.ffn_norm(x))
         return x
 
@@ -170,6 +203,22 @@ class GPT(nn.Module):
         # 파라미터를 vocab*d_model(약 8M)만큼 아낀다.
         self.lm_head.weight = self.tok_emb.weight
 
+        if cfg.mood_dim > 0:
+            # 읽기 헤드: 턴의 은닉 평균 -> 기분 관측 (update_mood에서 사용)
+            self.mood_read = nn.Linear(cfg.d_model, cfg.mood_dim)
+        if cfg.n_latent > 0:
+            # 은닉 상태 -> 다음 잠재 스텝의 입력. "생각을 다시 입력으로 쓸 때
+            # 어떤 모양이어야 하는지"를 학습할 수 있게 둔 projection.
+            self.latent_proj = nn.Linear(cfg.d_model, cfg.d_model)
+        if cfg.feedback:
+            # 역피드백: 최상층의 추상 상태(직전 토큰 최종 은닉)를 다음 토큰의
+            # 입력단에 방송한다 — "내가 방금 무엇을 생각했는지"를 알고 시작.
+            self.feedback_proj = nn.Linear(cfg.d_model, cfg.d_model)
+        if cfg.conf_head:
+            # 확신도 헤드: 은닉 상태를 읽고 "다음 예측이 맞을 확률"을 출력.
+            # 상태를 읽기만 하는 관찰자 — 학습 시 입력을 detach해 본체와 절연.
+            self.conf_head = nn.Linear(cfg.d_model, 1)
+
         rope = precompute_rope(cfg.d_model // cfg.n_heads, cfg.max_seq_len, cfg.rope_theta)
         self.register_buffer("rope", rope, persistent=False)
 
@@ -178,6 +227,26 @@ class GPT(nn.Module):
         for name, p in self.named_parameters():
             if name.endswith("wo.weight") or name.endswith("w_down.weight"):
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layers))
+        # 항등 초기화: 기능을 켠 직후에도 모델의 출력이 변하지 않게 한다
+        for block in self.blocks:
+            if hasattr(block, "mood_film"):
+                nn.init.zeros_(block.mood_film.weight)
+                nn.init.zeros_(block.mood_film.bias)
+        if cfg.n_latent > 0:
+            with torch.no_grad():
+                self.latent_proj.weight.copy_(torch.eye(cfg.d_model))
+                nn.init.zeros_(self.latent_proj.bias)
+        if cfg.feedback:
+            # 제로 초기화: 켠 직후에는 피드백이 0 — 출력이 변하지 않는다
+            nn.init.zeros_(self.feedback_proj.weight)
+            nn.init.zeros_(self.feedback_proj.bias)
+
+        # 학습/평가에서 loop 반복 횟수를 임시로 고정하는 오버라이드 (None = 기본)
+        self._loop_override: int | None = None
+        # 직전 generate 턴에서 모은 은닉 평균 (update_mood가 읽는다)
+        self._turn_hidden_mean: torch.Tensor | None = None
+        self._turn_conf_mean: float | None = None   # 직전 턴 평균 확신도
+        self._turn_latent_steps: int = 0             # 직전 턴 잠재 스텝 수
 
     @staticmethod
     def _init_weights(m):
@@ -188,18 +257,84 @@ class GPT(nn.Module):
         # tied weight는 한 번만 센다 (lm_head.weight == tok_emb.weight)
         return sum(p.numel() for p in self.parameters())
 
+    # ------------------------------------------------------------------
+    # 블록 실행 (loop 포함) — forward/generate/SFT가 전부 이 경로를 쓴다
+    # ------------------------------------------------------------------
+    def _block_order(self, n_loop: int | None = None) -> list[Block]:
+        """실행 순서의 블록 리스트. loop 구간은 그룹째로 n번 등장한다.
+        예: 8층, loop 2..6, n=2 -> b0 b1 [b2 b3 b4 b5] [b2 b3 b4 b5] b6 b7"""
+        s, e = self.cfg.loop_start, self.cfg.loop_end
+        n = self.cfg.n_loop if n_loop is None else n_loop
+        blocks = list(self.blocks)
+        if e > s and n > 1:
+            return blocks[:s] + blocks[s:e] * n + blocks[e:]
+        return blocks
+
+    def new_caches(self, n_loop: int | None = None) -> list[list]:
+        """실행 슬롯(블록×회차)마다 KV 캐시 하나 — 2회차의 k, v는 1회차와
+        다르므로 같은 블록이라도 회차 간에 캐시를 공유할 수 없다."""
+        return [[None, None] for _ in self._block_order(n_loop)]
+
+    def _run_blocks(self, x, rope, caches=None, mood=None, attn_mask=None,
+                    n_loop: int | None = None):
+        for i, block in enumerate(self._block_order(n_loop)):
+            cache = caches[i] if caches is not None else None
+            x = block(x, rope, cache, mood, attn_mask)
+        return x
+
+    def _embed(self, idx: torch.Tensor, feedback_h: torch.Tensor | None = None):
+        """토큰 임베딩 + (켜져 있으면) 역피드백: 위치 t의 입력에 위치 t-1의
+        최종 은닉을 projection해 더한다. feedback_h는 1-pass에서 미리 계산한
+        은닉 (B, T, C) — detach해서 1-pass로는 그래디언트가 흐르지 않는다."""
+        x = self.tok_emb(idx)
+        if feedback_h is not None:
+            fb = self.feedback_proj(feedback_h[:, :-1].detach())
+            x = torch.cat([x[:, :1], x[:, 1:] + fb], dim=1)
+        return x
+
+    def hidden_states(self, idx: torch.Tensor, mood=None, feedback_h=None,
+                      n_loop: int | None = None) -> torch.Tensor:
+        """final_norm까지 통과한 은닉 상태 (B, T, C). 로짓이 아니라 내부
+        표현이 필요할 때(기분 벡터 학습, 역피드백 1-pass 등) 쓴다."""
+        x = self._embed(idx, feedback_h)
+        x = self._run_blocks(x, self.rope[:idx.size(1)], mood=mood,
+                             n_loop=n_loop if n_loop is not None else self._loop_override)
+        return self.final_norm(x)
+
+    def run_from_pos(self, x_emb, pos: int, caches, mood=None, attn_mask=None):
+        """위치 pos부터의 임베딩을 KV 캐시를 이어 쓰며 통과시킨다.
+        잠재 사고 SFT처럼 시퀀스를 (접두부 / 잠재 스텝 / 답변부)로 쪼개
+        여러 번에 걸쳐 처리할 때 쓴다. 반환: final_norm 은닉 (B, T, C)."""
+        rope = self.rope[pos:pos + x_emb.size(1)]
+        x = self._run_blocks(x_emb, rope, caches, mood, attn_mask,
+                             n_loop=self._loop_override)
+        return self.final_norm(x)
+
+    # ------------------------------------------------------------------
+    # 학습 forward
+    # ------------------------------------------------------------------
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None,
-                loss_mask: torch.Tensor | None = None):
+                loss_mask: torch.Tensor | None = None, mood: torch.Tensor | None = None,
+                feedback_h: torch.Tensor | None = None):
         """idx: (B, T) 토큰 ID. targets가 있으면 loss도 함께 반환.
 
         학습의 전부: 위치 t까지 보고 위치 t+1의 토큰을 맞히는 것.
         targets는 idx를 한 칸 밀어 둔 것이고, loss는 cross entropy다.
+        feedback_h: 역피드백 2-pass 학습용 — 1-pass(피드백 없이 병렬)로 구한
+        은닉을 주면, 각 위치의 입력에 직전 위치의 은닉이 더해진다.
         """
         B, T = idx.shape
-        x = self.tok_emb(idx)
+        x = self._embed(idx, feedback_h)
         rope = self.rope[:T]
-        for block in self.blocks:
-            x = block(x, rope)
+
+        n_loop = self._loop_override
+        if n_loop is None and self.training and self.cfg.n_loop > 1:
+            # 확률적 반복 횟수: {1..n_loop} 균등 샘플. 적은 반복으로도 동작하는
+            # 해를 함께 유지해, CPU에서 n_loop=1 고속 모드가 유효해지고
+            # "반복 횟수별 성능" 평가도 한 가중치로 할 수 있게 된다.
+            n_loop = random.randint(1, self.cfg.n_loop)
+
+        x = self._run_blocks(x, rope, mood=mood, n_loop=n_loop)
         x = self.final_norm(x)
 
         if targets is None:
@@ -216,28 +351,109 @@ class GPT(nn.Module):
             loss = (loss * mask).sum() / mask.sum().clamp(min=1)
         else:
             loss = loss.mean()
+
+        if self.cfg.conf_head:
+            # 메타인지 학습: "방금 그 예측, 맞혔는가?"를 은닉에서 읽어 맞힌다.
+            # 라벨은 학습 데이터에 공짜로 들어 있다 (argmax == 정답 여부).
+            # x.detach() — 확신도는 상태를 읽기만 하고 본체를 바꾸지 못한다.
+            conf_logit = self.conf_head(x.detach()).squeeze(-1)     # (B, T)
+            with torch.no_grad():
+                correct = (logits.argmax(-1) == targets).float()
+            valid = (targets != -1).float()
+            if loss_mask is not None:
+                valid = valid * loss_mask.float()
+            bce = F.binary_cross_entropy_with_logits(conf_logit, correct,
+                                                     reduction="none")
+            conf_loss = (bce * valid).sum() / valid.sum().clamp(min=1)
+            self._last_conf_loss = conf_loss.detach()
+            loss = loss + 0.1 * conf_loss
+
         return logits, loss
 
+    # ------------------------------------------------------------------
+    # 기분 벡터
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def update_mood(self, mood: torch.Tensor, decay: float = 0.9) -> torch.Tensor:
+        """직전 generate 턴의 은닉 평균을 기분 관측으로 압축해 EMA로 갱신한다.
+            mood <- decay * mood + (1 - decay) * tanh(read(은닉 평균))
+        tanh로 유계라 긴 세션에서도 상태가 폭주하지 않는다."""
+        if self._turn_hidden_mean is None:
+            return mood
+        obs = torch.tanh(self.mood_read(self._turn_hidden_mean))
+        return decay * mood + (1 - decay) * obs
+
+    # ------------------------------------------------------------------
+    # 생성
+    # ------------------------------------------------------------------
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int,
                  temperature: float = 0.8, top_p: float = 0.95,
-                 stop_ids: set[int] | None = None):
+                 stop_ids: set[int] | None = None,
+                 mood: torch.Tensor | None = None,
+                 n_loop: int | None = None,
+                 n_latent: int | None = None,
+                 conf_threshold: float | None = None,
+                 max_latent: int | None = None):
         """토큰을 하나씩 뽑아 이어 나간다. KV 캐시로 매 스텝 O(전체)가 아닌
-        O(새 토큰 1개)만 계산한다. 생성된 토큰 ID를 하나씩 yield."""
+        O(새 토큰 1개)만 계산한다. 생성된 토큰 ID를 하나씩 yield.
+
+        n_latent > 0이면 프롬프트를 소화한 직후, 말하기 전에 은닉 상태를
+        자기 입력으로 k번 되먹이는 잠재 사고 스텝을 밟는다 (출력 없음).
+        mood가 주어지면 매 블록에 FiLM으로 주입된다.
+        conf_threshold가 주어지면(확신도 헤드 필요) 확신이 그 밑인 동안
+        잠재 스텝을 max_latent까지 추가로 밟는다 — 적응적 사고 시간."""
         self.eval()
-        caches = [[None, None] for _ in self.blocks]
+        if n_latent is None:
+            n_latent = self.cfg.n_latent
+        if idx.size(1) > self.cfg.max_seq_len:
+            idx = idx[:, -self.cfg.max_seq_len:]  # 문맥 초과분은 앞에서 자름
+        caches = self.new_caches(n_loop)
         pos = 0
-        x_in = idx  # 첫 스텝: 프롬프트 전체, 이후: 직전 생성 토큰 1개
+        hid_sum, hid_cnt = None, 0
+        conf_sum = 0.0
+
+        def step(x_emb):
+            """임베딩 (B, T, C)를 통과시키고 마지막 위치의 final_norm 은닉을 반환."""
+            nonlocal pos
+            rope = self.rope[pos:pos + x_emb.size(1)]
+            h = self._run_blocks(x_emb, rope, caches, mood, n_loop=n_loop)
+            pos += x_emb.size(1)
+            return self.final_norm(h[:, -1, :])
+
+        if self.cfg.feedback:
+            # 역피드백 2-pass (학습과 동일한 방식): 먼저 피드백 없이 병렬로
+            # 전 위치의 은닉을 구하고, 그것을 입력에 더한 채 캐시를 채운다
+            h_all = self.hidden_states(idx, n_loop=n_loop)
+            h_last = step(self._embed(idx, h_all))
+        else:
+            h_last = step(self.tok_emb(idx))
+
+        # --- 잠재 사고: 은닉 상태를 말 없이 자기 자신에게 되먹인다 ---
+        k_thought = 0
+        for _ in range(n_latent):
+            if pos + 1 > self.cfg.max_seq_len:
+                break
+            h_last = step(self.latent_proj(h_last).unsqueeze(1))
+            k_thought += 1
+
+        # --- 적응적 사고: 확신이 없으면 말하기 전에 더 생각한다 ---
+        if conf_threshold is not None and self.cfg.conf_head and self.cfg.n_latent > 0:
+            limit = max_latent if max_latent is not None else n_latent + 4
+            while (k_thought < limit and pos + 1 <= self.cfg.max_seq_len
+                   and torch.sigmoid(self.conf_head(h_last)).mean().item() < conf_threshold):
+                h_last = step(self.latent_proj(h_last).unsqueeze(1))
+                k_thought += 1
+        self._turn_latent_steps = k_thought
 
         for _ in range(max_new_tokens):
-            if pos + x_in.size(1) > self.cfg.max_seq_len:
-                break  # 문맥 길이 초과 — 이 미니 모델의 한계선
-            x = self.tok_emb(x_in)
-            rope = self.rope[pos:pos + x_in.size(1)]
-            for block, cache in zip(self.blocks, caches):
-                x = block(x, rope, cache)
-            pos += x_in.size(1)
-            logits = self.lm_head(self.final_norm(x[:, -1, :]))
+            # 기분 갱신용: 이 턴에서 샘플링에 쓴 은닉들의 평균을 모아 둔다
+            hid_sum = h_last.clone() if hid_sum is None else hid_sum + h_last
+            hid_cnt += 1
+            if self.cfg.conf_head:
+                conf_sum += torch.sigmoid(self.conf_head(h_last)).mean().item()
+
+            logits = self.lm_head(h_last)
 
             # --- 샘플링 ---
             # temperature: 낮으면 확률 높은 토큰에 집중(안전), 높으면 다양(모험)
@@ -255,4 +471,15 @@ class GPT(nn.Module):
             if stop_ids and next_id.item() in stop_ids:
                 break
             yield next_id.item()
-            x_in = next_id
+            if pos + 1 > self.cfg.max_seq_len:
+                break  # 문맥 길이 초과 — 이 미니 모델의 한계선
+            x_emb = self.tok_emb(next_id)
+            if self.cfg.feedback:
+                # 생성은 원래 순차라 진짜 피드백이 공짜다: 방금 그 생각(h_last)을
+                # 알고서 다음 토큰의 처리를 시작한다
+                x_emb = x_emb + self.feedback_proj(h_last)
+            h_last = step(x_emb)
+
+        if hid_cnt:
+            self._turn_hidden_mean = hid_sum / hid_cnt
+            self._turn_conf_mean = conf_sum / hid_cnt if self.cfg.conf_head else None
