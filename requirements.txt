@@ -1,0 +1,6 @@
+# 로컬(추론·개발)과 클라우드(학습) 공통 의존성
+torch>=2.1
+numpy
+regex           # 유니코드 카테고리(\p{L} 등) 지원 정규식 — BPE 사전 분할에 사용
+datasets        # HuggingFace 공개 데이터 다운로드 (학습 데이터 준비 시에만 필요)
+tqdm

@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 데이터·체크포인트는 용량이 커서 git에 넣지 않는다
+data/raw/
+data/bin/
+checkpoints/
+*.bin
+*.npy
+*.pt
