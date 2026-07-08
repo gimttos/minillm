@@ -56,6 +56,9 @@ def get_config(preset: str) -> TrainConfig:
             ),
             # loop로 활성값 메모리가 ~1.5배 -> 배치를 줄이고 accum으로 보전 (유효 480 유지)
             batch_size=16, grad_accum=30,
+            # Kaggle 12h 세션이 언제 끊길지 모른다 — 자주 저장해 재개 손실을 줄인다.
+            # eval마다 ckpt_best 후보, save마다 재개용 ckpt.pt.
+            eval_interval=100, save_interval=100,
             # 학습 중 반복 횟수를 {1,2}에서 확률 샘플하므로 그래프가 매번 달라져
             # torch.compile과 상성이 나쁘다 — loop 학습에서는 끈다
             compile=False,
