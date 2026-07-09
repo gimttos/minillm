@@ -48,23 +48,44 @@
 
 | 기제 | 켜는 곳 | 요약 |
 |---|---|---|
-| loop | full 프리셋 (사전학습) | 중간 블록 2..6을 2회 반복, 반복 횟수 확률 샘플 학습 |
+| loop | `full-loop` 프리셋 또는 SFT | 중간 블록 2..6을 2회 반복, 반복 횟수 확률 샘플 학습 |
 | pause | `prepare_sft --n-pause` + `sft --n-pause` | 답변 앞 `<\|pause\|>` 강제 삽입 (mask 0) |
 | mood | `sft --mood-dim` | 턴 간 지속·감쇠 기분 벡터, FiLM 주입, 2-pass 학습 |
 | latent | `sft --latent` | Coconut식 은닉 되먹임, 왼쪽 패딩+직사각 마스크로 병렬 학습 |
 | feedback | `sft --feedback` | 직전 토큰 최종 은닉→다음 입력 방송, 2-pass 근사 (mood와 1-pass 공유) |
 | conf | `sft --conf` | 확신도 헤드(detach 절연), `chat --adaptive-latent`로 적응적 사고 |
+| workspace | `sft --workspace-slots` | GWT 지속 작업공간 슬롯, ws_read 전역 방송(제로init)·ws_write EMA 갱신, 턴 내 고정으로 캐시 정합, `chat --workspace-file` 세션 지속 |
+| attn_schema | `sft --attn-schema` | AST 주의 도식 — 레이어별 어텐션 엔트로피를 은닉에서 회귀, 보조손실만(0.05), logits 불변 |
 
 보류된 아이디어(다시 제안되면 이 결정을 참고): FiLM 자기 억제(학습 신호 없음),
-레지스터 토큰(mood와 중복), 진짜 읽기-쓰기 메모리 슬롯(Block-Recurrent급 수술 —
-다음 세대 후보).
+레지스터 토큰(mood와 중복). 진짜 읽기-쓰기 메모리 슬롯은 workspace(C1)가
+부분적으로 실현 — 완전한 Block-Recurrent급 read-write 메모리는 다음 세대 후보.
+
+## 검증 하네스 (tools/) 와 지표 매핑
+
+각 기제가 실제로 기능하는지 수치로 확인하는 도구 D1~D6 + eval_loop. 인지과학
+지표(Butlin et al.)와의 1:1 대응은 `INDICATORS.md`. 도구: eval_conf(HOT 캘리브),
+eval_state(상태 지속), eval_intervention(개입 인과성), eval_thinking(latent vs
+pause), eval_integration(RPT 전파), eval_schema(AST 정확도). 전부 `--save`로
+`eval_out/` JSON. 공용 로더는 `tools/_common.py`.
+
+## 게이트 순서·불변식 (업그레이드 스펙 v0.1)
+
+- 게이트: (1)속도(fp16자동·토큰예산1B·Muon·base/SFT분리·프리페치) →
+  (2)데이터(나무위키 mix) → (3)재베이스라인(`BASELINE.md`) →
+  (4)마음확장(conf상시·workspace·attn_schema) → (5)검증(D1~D6) → (6)문서.
+- 강화된 불변식: 신규 기제는 **새 토큰을 도입하지 않는다**(전부 벡터/헤드
+  수준 → `.bin` 재패킹 불필요). T4는 하드웨어 bf16 없음 → fp16 자동.
 
 ## 현재 상태와 다음 단계
 
-- 코드는 6개 기제 전부 구현·검증 완료, 사전학습은 **아직 시작 전** (처음부터
-  vocab 16392 + loop 켜고 시작하는 전제).
-- 다음: Kaggle에서 데이터 준비 → `--preset full` 사전학습 (25~40h, 세션 3~4개)
-  → `tools/eval_loop`로 loop 효과 확인 → SFT 조합 실험 → 로컬 대화.
+- 코드는 8개 기제 + 검증 하네스 전부 구현·검증 완료. 옵티마이저 Muon 하이브리드,
+  토큰예산 기반 max_steps, 프리페치 데이터로더 반영. 사전학습은 **아직 시작 전**.
+- 권장 경로: `full`(base, loop off + compile on)로 빠르게 사전학습 →
+  SFT에서 마음 기제 조합 부여. loop를 사전학습에 넣으려면 `full-loop`.
+- 다음: Kaggle에서 `download --source mix` → tokenizer(랜덤샘플) → pack →
+  `pretrain --preset full --optimizer muon` 1회 완주하고 `BASELINE.md` 채우기
+  → SFT 조합 실험 → D1~D6 검증 → 로컬 대화.
 - 로컬 `tokenizer/tokenizer.json`은 3MB 샘플로 만든 테스트용 (커밋 안 됨).
   Kaggle에서 200MB로 학습한 진짜로 교체 예정.
 
