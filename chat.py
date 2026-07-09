@@ -71,6 +71,12 @@ def main():
                     help="매 턴 기분 상태를 출력하고 종료 시 mood_trajectory.npy로 저장")
     ap.add_argument("--show-conf", action="store_true",
                     help="매 턴 모델의 평균 확신도와 잠재 스텝 수를 출력")
+    ap.add_argument("--no-workspace", action="store_true", help="워크스페이스 끄기(비교 실험용)")
+    ap.add_argument("--workspace-file", default="",
+                    help="워크스페이스 슬롯을 세션 간 저장/복원할 파일")
+    ap.add_argument("--workspace-decay", type=float, default=0.95)
+    ap.add_argument("--show-workspace", action="store_true",
+                    help="매 턴 워크스페이스 슬롯 노름/상위 성분을 출력")
     ap.add_argument("--adaptive-latent", type=float, default=None, metavar="T",
                     help="확신도가 T보다 낮으면 잠재 스텝을 더 밟는다 (확신도 헤드 필요)")
     ap.add_argument("--max-latent", type=int, default=6,
@@ -121,6 +127,18 @@ def main():
         else:
             mood = torch.zeros(1, cfg.mood_dim, device=device)
         features.append(f"mood {cfg.mood_dim}d")
+
+    # --- 워크스페이스: 세션 지속 슬롯 상태 초기화/복원 ---
+    ws = None
+    if cfg.workspace_slots > 0 and not args.no_workspace:
+        ws_size = cfg.workspace_slots * (cfg.workspace_dim or cfg.d_model)
+        if args.workspace_file and Path(args.workspace_file).exists():
+            ws = torch.load(args.workspace_file, map_location=device)
+            print(f"워크스페이스 복원: {args.workspace_file} (‖ws‖={ws.norm():.3f})")
+        else:
+            ws = torch.zeros(1, ws_size, device=device)
+        features.append(f"workspace {cfg.workspace_slots}슬롯")
+
     if features:
         print(f"마음 유사 기제: {', '.join(features)}")
 
@@ -164,6 +182,8 @@ def main():
             # 첫 턴처럼 기분이 아직 0이면 None으로 — SFT 때도 "기분 없음"으로
             # 학습한 경로가 있어 이쪽이 자연스럽다
             mood_arg = mood if (mood is not None and mood.abs().max() > 0) else None
+            # 워크스페이스도 처음(빈 슬롯)엔 주입하지 않는다 — mood와 같은 규율
+            ws_arg = ws if (ws is not None and ws.abs().max() > 0) else None
 
             sys.stdout.write("봇 > ")
             sys.stdout.flush()
@@ -172,7 +192,7 @@ def main():
                                       stop_ids, mood=mood_arg, n_loop=n_loop,
                                       n_latent=args.n_latent,
                                       conf_threshold=args.adaptive_latent,
-                                      max_latent=args.max_latent):
+                                      max_latent=args.max_latent, ws=ws_arg):
                 out_ids.append(tid)
                 if tid not in skip_ids:
                     sys.stdout.write(tok.decode([tid]))
@@ -193,10 +213,22 @@ def main():
                     top = v.abs().topk(min(3, v.numel()))
                     dims = ", ".join(f"[{i}]={v[i]:+.2f}" for i in top.indices.tolist())
                     print(f"  (기분 ‖{v.norm():.3f}‖ {dims})\n")
+
+            # --- 워크스페이스도 턴 종료 시 은닉 요약으로 EMA 갱신 ---
+            if ws is not None:
+                ws = model.update_workspace(ws, decay=args.workspace_decay)
+                if args.show_workspace:
+                    v = ws.squeeze(0)
+                    top = v.abs().topk(min(3, v.numel()))
+                    dims = ", ".join(f"[{i}]={v[i]:+.2f}" for i in top.indices.tolist())
+                    print(f"  (워크스페이스 ‖{v.norm():.3f}‖ {dims})\n")
     finally:
         if mood is not None and args.mood_file:
             torch.save(mood.cpu(), args.mood_file)
             print(f"기분 저장: {args.mood_file}")
+        if ws is not None and args.workspace_file:
+            torch.save(ws.cpu(), args.workspace_file)
+            print(f"워크스페이스 저장: {args.workspace_file}")
         if trajectory and args.show_mood:
             import numpy as np
             np.save("mood_trajectory.npy", np.stack(trajectory))

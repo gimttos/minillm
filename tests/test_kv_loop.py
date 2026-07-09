@@ -26,29 +26,29 @@ def small_cfg(**kw) -> ModelConfig:
     return ModelConfig(**base)
 
 
-def full_logits(model, ids, mood=None):
-    return model.lm_head(model.hidden_states(ids, mood=mood))
+def full_logits(model, ids, mood=None, ws=None):
+    return model.lm_head(model.hidden_states(ids, mood=mood, ws=ws))
 
 
-def cached_logits(model, ids, mood=None):
+def cached_logits(model, ids, mood=None, ws=None):
     """generate와 같은 경로: 캐시를 쓰며 한 토큰씩."""
     caches = model.new_caches()
     outs = []
     for t in range(ids.size(1)):
-        h = model.run_from_pos(model.tok_emb(ids[:, t:t + 1]), t, caches, mood=mood)
+        h = model.run_from_pos(model.tok_emb(ids[:, t:t + 1]), t, caches, mood=mood, ws=ws)
         outs.append(model.lm_head(h))
     return torch.cat(outs, dim=1)
 
 
-def chunked_logits(model, ids, split):
+def chunked_logits(model, ids, split, ws=None):
     """잠재 SFT와 같은 경로: 접두부를 캐시에 쌓고 나머지를 직사각 마스크로 병렬."""
     caches = model.new_caches()
-    h1 = model.run_from_pos(model.tok_emb(ids[:, :split]), 0, caches)
+    h1 = model.run_from_pos(model.tok_emb(ids[:, :split]), 0, caches, ws=ws)
     S = ids.size(1) - split
     cols = torch.arange(split + S)
     rows = torch.arange(S)
     mask = (cols[None, :] <= (split + rows)[:, None]).view(1, 1, S, split + S)
-    h2 = model.run_from_pos(model.tok_emb(ids[:, split:]), split, caches, attn_mask=mask)
+    h2 = model.run_from_pos(model.tok_emb(ids[:, split:]), split, caches, attn_mask=mask, ws=ws)
     return model.lm_head(torch.cat([h1, h2], dim=1))
 
 
@@ -66,7 +66,9 @@ def main():
         ("loop 전 구간 x3", small_cfg(loop_start=0, loop_end=4, n_loop=3)),
         ("mood 16d", small_cfg(mood_dim=16)),
         ("latent 2", small_cfg(n_latent=2)),
-        ("전부 켬", small_cfg(loop_start=1, loop_end=3, n_loop=2, mood_dim=16, n_latent=2)),
+        ("workspace 3슬롯", small_cfg(workspace_slots=3)),
+        ("전부 켬", small_cfg(loop_start=1, loop_end=3, n_loop=2, mood_dim=16,
+                            n_latent=2, workspace_slots=2)),
     ]:
         print(f"[{label}]")
         model = GPT(cfg).eval()
@@ -77,12 +79,18 @@ def main():
             for block in model.blocks:
                 torch.nn.init.normal_(block.mood_film.weight, std=0.1)
             mood = torch.randn(2, cfg.mood_dim)
+        ws = None
+        if cfg.workspace_slots > 0:
+            # ws_read 제로 init를 무작위로 덮어써 방송이 실제로 뭔가 하게 한다
+            torch.nn.init.normal_(model.ws_read.weight, std=0.05)
+            ws = torch.randn(2, cfg.workspace_slots * cfg.d_model)
 
         with torch.no_grad():
-            full = full_logits(model, ids, mood=mood)
-            check("캐시 증분 == 일괄", cached_logits(model, ids, mood=mood), full)
+            full = full_logits(model, ids, mood=mood, ws=ws)
+            check("캐시 증분 == 일괄", cached_logits(model, ids, mood=mood, ws=ws), full)
             if mood is None:
-                check("접두부+직사각 마스크 == 일괄", chunked_logits(model, ids, 10), full)
+                check("접두부+직사각 마스크 == 일괄",
+                      chunked_logits(model, ids, 10, ws=ws), full)
 
     # --- 역피드백: 2-pass 병렬 처리와 캐시 증분 처리가 일치해야 한다 ---
     print("[역피드백]")
@@ -117,20 +125,25 @@ def main():
 
         # 기존 체크포인트를 새 기능을 전부 켠 모델에 strict=False로 로드
         on = GPT(small_cfg(mood_dim=16, n_latent=2, feedback=True,
-                           conf_head=True)).eval()
+                           conf_head=True, workspace_slots=3, attn_schema=True)).eval()
         missing, unexpected = on.load_state_dict(base.state_dict(), strict=False)
         assert not unexpected, f"unexpected keys: {unexpected}"
         check("strict=False 로드 후 출력 동일", full_logits(on, ids), ref)
         check("mood=0 벡터도 출력 동일 (FiLM 제로 초기화)",
               full_logits(on, ids, mood=torch.zeros(2, 16)), ref)
+        # 워크스페이스: ws_read 제로 init라 슬롯 상태가 무엇이든 출력 불변
+        ws_rand = torch.randn(2, 3 * 32)
+        check("ws_read 제로 초기화 = 항등", full_logits(on, ids, ws=ws_rand), ref)
         v = torch.randn(3, 32)
         check("latent_proj는 항등 초기화", on.latent_proj(v), v)
 
-    # 확신도 헤드: loss에 conf 항이 붙어도 logits는 변하지 않는다 (detach 절연)
+    # 확신도·도식 헤드: loss에 conf/schema 항이 붙어도 logits는 불변 (detach 절연)
     y = torch.randint(0, 64, (2, 20))
-    logits_on, _ = on(ids, y)
+    logits_on, loss_on = on(ids, y)
     logits_base, _ = base(ids, y)
-    check("conf_head 켜도 logits 불변", logits_on, logits_base)
+    check("conf_head/attn_schema 켜도 logits 불변", logits_on, logits_base)
+    assert on._last_schema_loss is not None, "attn_schema 손실이 계산되지 않음"
+    print(f"  ok: attn_schema 손실 계산됨 ({on._last_schema_loss.item():.4f})")
 
     print("\n모든 테스트 통과.")
 

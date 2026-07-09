@@ -77,6 +77,18 @@ def mood_from_context(model, x, y, m, h=None):
     return torch.tanh(model.mood_read(pool.detach()))   # (B, mood_dim)
 
 
+def ws_from_context(model, x, y, m, h=None):
+    """워크스페이스 2-pass 학습(§C1): 문맥의 은닉 평균을 슬롯 상태로 압축한다.
+    mood와 대칭 — 세션엔 멀티턴 상태가 없으니, 문맥을 슬롯으로 압축해 조건화하는
+    법(ws_write)과 방송으로 읽는 법(ws_read)을 함께 배운다."""
+    if h is None:
+        with torch.no_grad():
+            h = model.hidden_states(x)
+    sel = ((y != -1) & (m == 0)).float().unsqueeze(-1)
+    pool = (h * sel).sum(1) / sel.sum(1).clamp(min=1)   # (B, C)
+    return torch.tanh(model.ws_write(pool.detach()))    # (B, slots*dim)
+
+
 # ---------------------------------------------------------------------------
 # 잠재 사고(Coconut): 배치 구성과 loss
 # ---------------------------------------------------------------------------
@@ -181,21 +193,60 @@ def latent_loss(model, prefix, pad_len, suffix_x, suffix_y, suffix_m, first_y, k
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def estimate_val(model, val_idx, boundaries, ids, mask, block, batch_size, pad_id,
-                 device, use_mood=False):
-    """검증 예시 전체의 masked loss 평균. use_mood면 2-pass(기분 주입)로 잰다.
+                 device, use_mood=False, use_ws=False):
+    """검증 예시 전체의 masked loss 평균. use_mood/use_ws면 2-pass(주입)로 잰다.
     역피드백은 켜져 있으면(model.cfg.feedback) 항상 반영 — 추론과 같은 조건."""
     model.eval()
     losses = []
     for i in range(0, len(val_idx), batch_size):
         picks = val_idx[i:i + batch_size]
         x, y, m = make_batch(picks, boundaries, ids, mask, block, pad_id, device)
-        h = model.hidden_states(x) if (use_mood or model.cfg.feedback) else None
+        h = (model.hidden_states(x)
+             if (use_mood or use_ws or model.cfg.feedback) else None)
         mood = mood_from_context(model, x, y, m, h=h) if use_mood else None
+        ws = ws_from_context(model, x, y, m, h=h) if use_ws else None
         fh = h if model.cfg.feedback else None
-        _, loss = model(x, y, loss_mask=m, mood=mood, feedback_h=fh)
+        _, loss = model(x, y, loss_mask=m, mood=mood, feedback_h=fh, ws=ws)
         losses.append(loss.item())
     model.train()
     return sum(losses) / max(len(losses), 1)
+
+
+@torch.no_grad()
+def estimate_ece(model, val_idx, boundaries, ids, mask, block, batch_size, pad_id,
+                 device, bins=10):
+    """검증셋 답변 토큰에서 ECE(Expected Calibration Error)를 계산한다 (§C3).
+
+    확신도 헤드를 1급 지표로 승격 — 정식 리포트는 tools/eval_conf.py지만,
+    학습 중 주기적으로 찍어 캘리브레이션 추이를 본다. 낮을수록 잘 보정됨.
+    """
+    model.eval()
+    confs, corrs = [], []
+    for i in range(0, len(val_idx), batch_size):
+        picks = val_idx[i:i + batch_size]
+        x, y, m = make_batch(picks, boundaries, ids, mask, block, pad_id, device)
+        h = model.hidden_states(x)
+        if model.cfg.feedback:
+            h = model.hidden_states(x, feedback_h=h)   # 추론과 같은 2-pass
+        logits = model.lm_head(h)
+        conf = torch.sigmoid(model.conf_head(h).squeeze(-1))
+        correct = (logits.argmax(-1) == y).float()
+        sel = ((y != -1).float() * m).bool()
+        confs.append(conf[sel])
+        corrs.append(correct[sel])
+    model.train()
+    conf = torch.cat(confs).cpu().numpy()
+    correct = torch.cat(corrs).cpu().numpy()
+    if len(conf) == 0:
+        return float("nan")
+    ece = 0.0
+    for b in range(bins):
+        lo, hi = b / bins, (b + 1) / bins
+        s = (conf >= lo) & (conf < hi if b < bins - 1 else conf <= hi)
+        if s.sum() == 0:
+            continue
+        ece += s.mean() * abs(conf[s].mean() - correct[s].mean())
+    return float(ece)
 
 
 def main():
@@ -218,6 +269,12 @@ def main():
                     help="역피드백: 직전 토큰의 최종 은닉을 다음 토큰 입력에 방송 (2-pass)")
     ap.add_argument("--conf", action="store_true",
                     help="확신도 헤드: '다음 토큰을 맞힐 것인가'를 스스로 예측 (메타인지)")
+    ap.add_argument("--workspace-slots", type=int, default=0,
+                    help="워크스페이스 슬롯 수 (0=off) — GWT 지속 작업공간")
+    ap.add_argument("--workspace-dim", type=int, default=0,
+                    help="슬롯 하나의 차원 (0=d_model)")
+    ap.add_argument("--attn-schema", action="store_true",
+                    help="주의 도식 헤드: 레이어별 어텐션 엔트로피를 은닉에서 예측 (AST)")
     ap.add_argument("--tokenizer", default="tokenizer/tokenizer.json",
                     help="--latent 사용 시 <|assistant|> 위치를 찾는 데 필요")
     ap.add_argument("--val-frac", type=float, default=0.02)
@@ -242,6 +299,11 @@ def main():
         cfg.feedback = True
     if args.conf:
         cfg.conf_head = True
+    if args.workspace_slots:
+        cfg.workspace_slots = args.workspace_slots
+        cfg.workspace_dim = args.workspace_dim
+    if args.attn_schema:
+        cfg.attn_schema = True
     model = GPT(cfg).to(args.device)
     missing, unexpected = model.load_state_dict(ck["model"], strict=False)
     if missing or unexpected:
@@ -301,6 +363,8 @@ def main():
             path = "latent"
         elif cfg.mood_dim and random.random() < 0.5:
             path = "mood"
+        elif cfg.workspace_slots and random.random() < 0.5:
+            path = "ws"
 
         def compute_loss():
             if path == "latent":
@@ -312,14 +376,15 @@ def main():
                     return latent_loss(model, *batch, k=args.latent)
             x, y, m = make_batch(picks, boundaries, ids, mask,
                                  cfg.max_seq_len, pad_id, args.device)
-            # 1-pass 은닉은 기분과 역피드백이 공유한다 — 같이 켜도 비용 동일
+            # 1-pass 은닉은 기분/워크스페이스/역피드백이 공유한다 — 같이 켜도 비용 동일
             h = None
-            if cfg.feedback or path == "mood":
+            if cfg.feedback or path in ("mood", "ws"):
                 with torch.no_grad():
                     h = model.hidden_states(x)
             mood = mood_from_context(model, x, y, m, h=h) if path == "mood" else None
+            ws = ws_from_context(model, x, y, m, h=h) if path == "ws" else None
             fh = h if cfg.feedback else None
-            _, loss = model(x, y, loss_mask=m, mood=mood, feedback_h=fh)
+            _, loss = model(x, y, loss_mask=m, mood=mood, feedback_h=fh, ws=ws)
             return loss
 
         if use_amp:
@@ -337,7 +402,9 @@ def main():
         if step % 50 == 0:
             extra = ""
             if cfg.conf_head and getattr(model, "_last_conf_loss", None) is not None:
-                extra = f" | conf {model._last_conf_loss.item():.3f}"
+                extra += f" | conf {model._last_conf_loss.item():.3f}"
+            if cfg.attn_schema and getattr(model, "_last_schema_loss", None) is not None:
+                extra += f" | schema {model._last_schema_loss.item():.3f}"
             print(f"step {step:>5}/{steps} | loss {loss.item():.3f} | lr {lr:.2e} | {path}{extra}")
 
         if step > 0 and step % args.eval_interval == 0:
@@ -349,6 +416,15 @@ def main():
                                   cfg.max_seq_len, args.batch_size, pad_id,
                                   args.device, use_mood=True)
                 line += f" | mood 주입 시 {vm:.3f}"
+            if cfg.workspace_slots:
+                vw = estimate_val(model, val_idx, boundaries, ids, mask,
+                                  cfg.max_seq_len, args.batch_size, pad_id,
+                                  args.device, use_ws=True)
+                line += f" | ws 주입 시 {vw:.3f}"
+            if cfg.conf_head:
+                ece = estimate_ece(model, val_idx, boundaries, ids, mask,
+                                   cfg.max_seq_len, args.batch_size, pad_id, args.device)
+                line += f" | ECE {ece:.3f}"
             print(line)
             if vloss < best_val:
                 best_val = vloss
