@@ -10,3 +10,7 @@ checkpoints/
 *.bin
 *.npy
 *.pt
+
+# 검증 하네스(D1~D6) 산출물
+eval_out/
+mood_trajectory.npy

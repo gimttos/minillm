@@ -10,6 +10,8 @@ SFT 검증 예시에서 답변 토큰마다 (모델의 확신도, 실제로 맞�
 """
 
 import argparse
+import json
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -27,6 +29,8 @@ def main():
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--bins", type=int, default=10)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--save", nargs="?", const="eval_out/reliability.json", default="",
+                    help="신뢰도 다이어그램을 JSON으로 저장 (기본 eval_out/reliability.json)")
     args = ap.parse_args()
 
     ck = torch.load(args.ckpt, map_location=args.device)
@@ -68,6 +72,7 @@ def main():
           f"| 실제 정답률 {correct.mean():.3f}")
     print(f"{'확신도 구간':>14} | {'개수':>7} | {'실제 정답률':>10}")
     ece = 0.0  # Expected Calibration Error: |확신 - 실제|의 가중 평균
+    diagram = []  # 신뢰도 다이어그램 데이터 (--save)
     for b in range(args.bins):
         lo, hi = b / args.bins, (b + 1) / args.bins
         sel = (conf >= lo) & (conf < hi if b < args.bins - 1 else conf <= hi)
@@ -76,7 +81,18 @@ def main():
         acc = correct[sel].mean()
         ece += sel.mean() * abs(conf[sel].mean() - acc)
         print(f"  [{lo:.1f}, {hi:.1f}) | {int(sel.sum()):>7,} | {acc:>10.3f}")
+        diagram.append({"lo": lo, "hi": hi, "count": int(sel.sum()),
+                        "mean_conf": float(conf[sel].mean()), "accuracy": float(acc)})
     print(f"ECE (낮을수록 잘 보정됨): {ece:.4f}")
+
+    if args.save:
+        out = Path(args.save)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "w", encoding="utf-8") as f:
+            json.dump({"n": len(conf), "mean_conf": float(conf.mean()),
+                       "accuracy": float(correct.mean()), "ece": float(ece),
+                       "bins": diagram}, f, ensure_ascii=False, indent=2)
+        print(f"신뢰도 다이어그램 저장: {out}")
 
 
 if __name__ == "__main__":
