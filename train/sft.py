@@ -38,6 +38,7 @@ import torch
 import torch.nn.functional as F
 
 from model.gpt import GPT, ModelConfig
+from train.config import pick_amp_dtype
 from train.pretrain import _save
 
 
@@ -206,7 +207,8 @@ def main():
     ap.add_argument("--batch-size", type=int, default=16)
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--device", default="cuda")
-    ap.add_argument("--dtype", default="bfloat16")
+    ap.add_argument("--dtype", default="auto",
+                    help="AMP dtype (auto=장치 능력으로 T4 fp16 / Ampere+ bf16 자동)")
     # --- 마음 유사 기제 ---
     ap.add_argument("--mood-dim", type=int, default=0, help="기분 벡터 차원 (0=off)")
     ap.add_argument("--latent", type=int, default=0, help="잠재 사고 스텝 수 (0=off)")
@@ -269,9 +271,12 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
                             betas=(0.9, 0.95), weight_decay=0.0)
 
-    use_amp = args.device == "cuda"
-    amp_dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-    scaler = torch.amp.GradScaler(enabled=(use_amp and args.dtype == "float16"))
+    dtype = pick_amp_dtype(args.device) if args.dtype == "auto" else args.dtype
+    if args.device == "cuda":
+        print(f"AMP dtype: {dtype}")
+    use_amp = args.device == "cuda" and dtype in ("float16", "bfloat16")
+    amp_dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float16
+    scaler = torch.amp.GradScaler(enabled=(use_amp and dtype == "float16"))
 
     best_val = float("inf")
     saved_best = False

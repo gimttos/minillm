@@ -11,12 +11,16 @@
 
 사용법:
     python -m train.pretrain --preset tiny                    # 로컬 검증
-    python -m train.pretrain --preset full                    # 클라우드
+    python -m train.pretrain --preset full                    # 클라우드(base)
     python -m train.pretrain --preset full --resume           # 이어서
+    python -m train.pretrain --preset full --optimizer muon   # Muon 하이브리드
+    python -m train.pretrain --preset full --target-tokens 500000000  # 예산 스윕
 """
 
 import argparse
 import math
+import queue
+import threading
 import time
 from pathlib import Path
 
@@ -24,7 +28,8 @@ import numpy as np
 import torch
 
 from model.gpt import GPT
-from train.config import get_config
+from train.config import get_config, pick_amp_dtype
+from train.muon import build_optimizer_bundle
 
 
 def get_batch(data: np.memmap, block_size: int, batch_size: int, device: str):
@@ -38,6 +43,60 @@ def get_batch(data: np.memmap, block_size: int, batch_size: int, device: str):
         # non_blocking 전송으로 GPU가 노는 시간을 줄인다
         return x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
     return x.to(device), y.to(device)
+
+
+class Prefetcher:
+    """백그라운드 스레드로 다음 배치를 미리 만들어 큐에 채운다 (§A5).
+
+    이 모델은 작고 빨라 동기식 배치 준비(파이썬 루프 + np.stack + pin + 전송)가
+    GPU를 놀린다. 배치 생성을 학습 스텝과 겹쳐 GPU 활용률을 올린다.
+    CUDA 스트림까지는 불필요(과설계 금지) — 큐(maxsize=2) 하나면 충분.
+    """
+
+    def __init__(self, data, block, batch, device, seed=0):
+        self.data, self.block, self.batch, self.device = data, block, batch, device
+        self.rng = np.random.default_rng(seed)
+        self.q: queue.Queue = queue.Queue(maxsize=2)
+        self.exc = None
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._worker, daemon=True)
+        self._t.start()
+
+    def _make(self):
+        ix = self.rng.integers(0, len(self.data) - self.block - 1, size=self.batch)
+        x = np.stack([self.data[i:i + self.block].astype(np.int64) for i in ix])
+        y = np.stack([self.data[i + 1:i + 1 + self.block].astype(np.int64) for i in ix])
+        x, y = torch.from_numpy(x), torch.from_numpy(y)
+        if self.device == "cuda":
+            x, y = x.pin_memory(), y.pin_memory()
+        return x, y
+
+    def _worker(self):
+        try:
+            while not self._stop.is_set():
+                batch = self._make()
+                while not self._stop.is_set():
+                    try:
+                        self.q.put(batch, timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue
+        except Exception as e:              # 스레드 예외를 메인으로 전파
+            self.exc = e
+            self.q.put(None)
+
+    def get(self):
+        item = self.q.get()
+        if item is None:
+            raise self.exc or RuntimeError("prefetch 스레드가 죽었습니다")
+        x, y = item
+        if self.device == "cuda":
+            return (x.to(self.device, non_blocking=True),
+                    y.to(self.device, non_blocking=True))
+        return x.to(self.device), y.to(self.device)
+
+    def close(self):
+        self._stop.set()
 
 
 def lr_at(step: int, cfg) -> float:
@@ -65,12 +124,38 @@ def estimate_loss(model, data, cfg):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--preset", default="full", choices=["tiny", "tiny-loop", "full"])
+    ap.add_argument("--preset", default="full",
+                    choices=["tiny", "tiny-loop", "full", "full-loop"])
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--init-from", default="", help="이 체크포인트 가중치로 시작(재개 아님)")
+    ap.add_argument("--target-tokens", type=int, default=0,
+                    help="토큰 예산 오버라이드 (0=프리셋 값). max_steps를 유도")
+    ap.add_argument("--optimizer", default="", choices=["", "adamw", "muon"],
+                    help="옵티마이저 오버라이드 (기본=프리셋)")
+    ap.add_argument("--dtype", default="", help="AMP dtype 오버라이드 (기본=auto)")
     args = ap.parse_args()
 
     cfg = get_config(args.preset)
+    if args.target_tokens:
+        cfg.target_tokens = args.target_tokens
+    if args.optimizer:
+        cfg.optimizer = args.optimizer
+    if args.dtype:
+        cfg.dtype = args.dtype
+
+    # --- 토큰 예산 → max_steps 유도 (§A1) ---
+    cfg.max_steps = cfg.resolve_max_steps()
+    if cfg.target_tokens:
+        print(f"토큰 예산 {cfg.target_tokens/1e9:.2f}B tokens -> {cfg.max_steps} steps "
+              f"(유효배치 {cfg.batch_size*cfg.grad_accum}×{cfg.model.max_seq_len})")
+
+    # --- AMP dtype 자동 선택 (§A2) ---
+    if cfg.dtype == "auto":
+        cfg.dtype = pick_amp_dtype(cfg.device)
+    if cfg.device == "cuda":
+        cap = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else (0, 0)
+        print(f"AMP dtype: {cfg.dtype} (cap {cap[0]}.{cap[1]})")
+
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
     if cfg.device == "cuda":
@@ -84,12 +169,9 @@ def main():
     val_data = np.memmap(Path(cfg.data_dir) / "val.bin", dtype=np.uint16, mode="r")
 
     model = GPT(cfg.model).to(cfg.device)
-    print(f"파라미터 수: {model.num_params() / 1e6:.1f}M")
+    print(f"파라미터 수: {model.num_params() / 1e6:.1f}M | 옵티마이저: {cfg.optimizer}")
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg.learning_rate,
-        betas=(cfg.beta1, cfg.beta2), weight_decay=cfg.weight_decay,
-    )
+    optimizer = build_optimizer_bundle(model, cfg)
 
     start_step = 0
     best_val = float("inf")
@@ -97,7 +179,7 @@ def main():
     if args.resume and ckpt_path.exists():
         ck = torch.load(ckpt_path, map_location=cfg.device)
         model.load_state_dict(ck["model"])
-        optimizer.load_state_dict(ck["optim"])
+        optimizer.load_state_dict(ck["optim"])   # 종류 불일치 시 내부에서 새로 시작
         start_step = ck["step"] + 1
         best_val = ck.get("best_val", best_val)
         print(f"재개: step {start_step}부터 (지금까지 best_val={best_val:.3f})")
@@ -116,48 +198,59 @@ def main():
     scaler = torch.amp.GradScaler(enabled=(use_amp and cfg.dtype == "float16"))
 
     if cfg.compile:
+        t_c = time.time()
         model = torch.compile(model)
+        print(f"torch.compile 준비(첫 스텝에서 컴파일; 여기선 래핑만 {time.time()-t_c:.1f}s)")
+
+    prefetch = Prefetcher(train_data, cfg.model.max_seq_len, cfg.batch_size,
+                          cfg.device, seed=cfg.seed)
 
     model.train()
     t0 = time.time()
-    for step in range(start_step, cfg.max_steps):
-        lr = lr_at(step, cfg)
-        for g in optimizer.param_groups:
-            g["lr"] = lr
+    try:
+        for step in range(start_step, cfg.max_steps):
+            # Muon과 AdamW의 서로 다른 base_lr에 공통 코사인 계수를 곱한다
+            scale = lr_at(step, cfg) / cfg.learning_rate
+            optimizer.set_lr_scale(scale)
 
-        # --- grad accumulation: 작은 배치 여러 번의 그래디언트를 모아 큰 배치 흉내 ---
-        for micro in range(cfg.grad_accum):
-            x, y = get_batch(train_data, cfg.model.max_seq_len, cfg.batch_size, cfg.device)
-            if use_amp:
-                with torch.autocast(device_type="cuda", dtype=amp_dtype):
+            # --- grad accumulation: 작은 배치 여러 번의 그래디언트를 모아 큰 배치 흉내 ---
+            for micro in range(cfg.grad_accum):
+                x, y = prefetch.get()
+                if use_amp:
+                    with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                        _, loss = model(x, y)
+                else:
                     _, loss = model(x, y)
-            else:
-                _, loss = model(x, y)
-            loss = loss / cfg.grad_accum
-            scaler.scale(loss).backward()
+                loss = loss / cfg.grad_accum
+                scaler.scale(loss).backward()
 
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
-        optimizer.zero_grad(set_to_none=True)
+            for opt in optimizer.optimizers:
+                scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            for opt in optimizer.optimizers:
+                scaler.step(opt)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
-        if step % cfg.log_interval == 0:
-            dt = time.time() - t0
-            t0 = time.time()
-            per = dt / cfg.log_interval if step > start_step else dt
-            print(f"step {step:>6} | loss {loss.item() * cfg.grad_accum:.3f} "
-                  f"| lr {lr:.2e} | {per * 1000:.0f} ms/step")
+            if step % cfg.log_interval == 0:
+                dt = time.time() - t0
+                t0 = time.time()
+                per = dt / cfg.log_interval if step > start_step else dt
+                lrs = " ".join(f"{k} {v:.2e}" for k, v in optimizer.current_lrs().items())
+                print(f"step {step:>6} | loss {loss.item() * cfg.grad_accum:.3f} "
+                      f"| {lrs} | {per * 1000:.0f} ms/step")
 
-        if step > 0 and step % cfg.eval_interval == 0:
-            vloss = estimate_loss(model, val_data, cfg)
-            print(f"  >> val loss {vloss:.3f} (best {best_val:.3f})")
-            if vloss < best_val:
-                best_val = vloss
-                _save(out_dir / "ckpt_best.pt", model, optimizer, step, best_val, cfg)
+            if step > 0 and step % cfg.eval_interval == 0:
+                vloss = estimate_loss(model, val_data, cfg)
+                print(f"  >> val loss {vloss:.3f} (best {best_val:.3f})")
+                if vloss < best_val:
+                    best_val = vloss
+                    _save(out_dir / "ckpt_best.pt", model, optimizer, step, best_val, cfg)
 
-        if step > 0 and step % cfg.save_interval == 0:
-            _save(ckpt_path, model, optimizer, step, best_val, cfg)
+            if step > 0 and step % cfg.save_interval == 0:
+                _save(ckpt_path, model, optimizer, step, best_val, cfg)
+    finally:
+        prefetch.close()
 
     _save(ckpt_path, model, optimizer, cfg.max_steps - 1, best_val, cfg)
     print("학습 완료.")
