@@ -57,6 +57,8 @@ def _clean_conversation(obj):
 def _iter_raw(input_dir):
     """input_dir 아래의 모든 대화 JSON을 (id, obj)로 흘려보낸다.
     .json 파일과 .zip 안의 .json 멤버를 모두 다룬다."""
+    # 파이썬 glob은 ~를 풀지 않는다 (셸이 아니라). 직접 확장해 준다.
+    input_dir = os.path.expanduser(input_dir)
     jsons = glob.glob(os.path.join(input_dir, "**", "*.json"), recursive=True)
     for fp in jsons:
         try:
@@ -87,6 +89,11 @@ def main():
     ap.add_argument("--out", default="data/raw/sns_convos.jsonl")
     args = ap.parse_args()
 
+    in_dir = os.path.expanduser(args.input)
+    if not os.path.isdir(in_dir):
+        raise SystemExit(f"입력 폴더가 없습니다: {in_dir}\n"
+                         f"  → .json 또는 .zip 파일들이 든 폴더 경로를 --input에 주세요.")
+
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     n_in = n_out = 0
     with open(args.out, "w", encoding="utf-8") as w:
@@ -97,6 +104,9 @@ def main():
                 continue
             w.write(json.dumps({"id": cid, "turns": turns}, ensure_ascii=False) + "\n")
             n_out += 1
+    if n_in == 0:
+        print(f"⚠️  {in_dir} 안에서 .json/.zip을 하나도 못 찾았습니다. "
+              f"경로에 실제 데이터 파일이 있는지 확인하세요.")
     print(f"{n_in:,}개 원본 -> {n_out:,}개 대화 (3인·이상 제외) -> {args.out}")
 
 
