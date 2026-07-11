@@ -92,7 +92,8 @@ def ws_from_context(model, x, y, m, h=None):
 # ---------------------------------------------------------------------------
 # 잠재 사고(Coconut): 배치 구성과 loss
 # ---------------------------------------------------------------------------
-def make_latent_batch(picks, boundaries, ids, mask, a_id, pad_id, device):
+def make_latent_batch(picks, boundaries, ids, mask, a_id, pad_id, device,
+                      block=0, k=0):
     """예시들을 <|assistant|> 직후에서 갈라 (접두부, 답변부) 배치로 만든다.
 
     접두부는 왼쪽 패딩(모든 행의 <|assistant|>가 마지막 열에 오도록),
@@ -102,7 +103,17 @@ def make_latent_batch(picks, boundaries, ids, mask, a_id, pad_id, device):
     왼쪽 패딩이 RoPE를 깨지 않는 이유: RoPE는 상대 거리만 보는데, 한 행 안의
     실제 토큰들은 여전히 연속된 열에 있어 상대 거리가 전부 보존된다.
     패딩 열은 attn_mask로 어텐션에서 제외한다.
+
+    block(=model max_seq_len)을 주면 전역 위치 예산 P + k + S <= block 을
+    강제한다. RoPE 테이블이 block 행까지만 있는데 run_from_pos 의 슬라이스는
+    범위를 넘어도 조용히 짧아지기만 해서, 넘는 순간 apply_rope 의 곱에서
+    shape 불일치로 터진다. P 는 배치 내 최장 접두부, S 는 최장 답변부라
+    서로 다른 예시에서 오므로, 예시 하나하나가 block 이하여도 합은 넘을 수
+    있다 — 그래서 예시 단위가 아니라 배치 단위로 잘라야 한다.
     """
+    # 접두부 예산: 잠재 k스텝 + 답변 최소 1토큰 자리를 남긴다
+    max_pre = (block - k - 1) if block else 10 ** 9
+
     rows = []
     for p in picks:
         s, e = boundaries[p], boundaries[p + 1]
@@ -111,13 +122,21 @@ def make_latent_batch(picks, boundaries, ids, mask, a_id, pad_id, device):
         a_pos = np.where(seg_ids == a_id)[0]
         if len(a_pos) == 0:
             continue  # 형식이 깨진 예시는 건너뜀
-        rows.append((seg_ids, seg_mask, int(a_pos[0]) + 1))  # 접두부는 <|assistant|> 포함
+        split = int(a_pos[0]) + 1                     # 접두부는 <|assistant|> 포함
+        if split > max_pre:
+            # 접두부가 예산을 넘으면 왼쪽(가장 오래된 문맥)을 버린다 —
+            # 질문 뒷부분과 <|assistant|>는 보존되므로 학습 신호는 유지된다
+            cut = split - max_pre
+            seg_ids, seg_mask, split = seg_ids[cut:], seg_mask[cut:], max_pre
+        rows.append((seg_ids, seg_mask, split))
 
     if not rows:
         return None
     B = len(rows)
     P = max(r[2] for r in rows)                       # 접두부 길이 (왼쪽 패딩 후)
     S = max(len(r[0]) - r[2] - 1 for r in rows)       # 답변부 입력 길이
+    if block:
+        S = min(S, block - k - P)                     # 남은 위치 예산만큼만 (>=1 보장)
     prefix = np.full((B, P), pad_id, dtype=np.int64)
     pad_len = np.zeros(B, dtype=np.int64)
     suffix_x = np.full((B, S), pad_id, dtype=np.int64)
@@ -131,10 +150,10 @@ def make_latent_batch(picks, boundaries, ids, mask, a_id, pad_id, device):
         prefix[i, pl:] = seg_ids[:split]
         first_y[i] = seg_ids[split]
         sx = seg_ids[split:-1]                        # 각 위치 t가 t+1을 맞힌다
-        n = len(sx)
-        suffix_x[i, :n] = sx
-        suffix_y[i, :n] = seg_ids[split + 1:]
-        suffix_m[i, :n] = seg_mask[split + 1:]
+        n = min(len(sx), S)                           # 예산 초과분(답변 꼬리)은 잘라냄
+        suffix_x[i, :n] = sx[:n]
+        suffix_y[i, :n] = seg_ids[split + 1:split + 1 + n]
+        suffix_m[i, :n] = seg_mask[split + 1:split + 1 + n]
 
     to = lambda a: torch.from_numpy(a).to(device)
     return to(prefix), to(pad_len), to(suffix_x), to(suffix_y), to(suffix_m), to(first_y)
@@ -371,7 +390,8 @@ def main():
                 # 역피드백은 이 경로에 얹지 않는다 — 잠재 스텝의 입력 자체가
                 # 이미 전대역 피드백이라 중복이다
                 batch = make_latent_batch(picks, boundaries, ids, mask,
-                                          a_id, pad_id, args.device)
+                                          a_id, pad_id, args.device,
+                                          block=cfg.max_seq_len, k=args.latent)
                 if batch is not None:
                     return latent_loss(model, *batch, k=args.latent)
             x, y, m = make_batch(picks, boundaries, ids, mask,
