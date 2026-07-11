@@ -478,7 +478,8 @@ class GPT(nn.Module):
                  n_latent: int | None = None,
                  conf_threshold: float | None = None,
                  max_latent: int | None = None,
-                 ws: torch.Tensor | None = None):
+                 ws: torch.Tensor | None = None,
+                 repetition_penalty: float = 1.0):
         """토큰을 하나씩 뽑아 이어 나간다. KV 캐시로 매 스텝 O(전체)가 아닌
         O(새 토큰 1개)만 계산한다. 생성된 토큰 ID를 하나씩 yield.
 
@@ -486,7 +487,13 @@ class GPT(nn.Module):
         자기 입력으로 k번 되먹이는 잠재 사고 스텝을 밟는다 (출력 없음).
         mood가 주어지면 매 블록에 FiLM으로 주입된다.
         conf_threshold가 주어지면(확신도 헤드 필요) 확신이 그 밑인 동안
-        잠재 스텝을 max_latent까지 추가로 밟는다 — 적응적 사고 시간."""
+        잠재 스텝을 max_latent까지 추가로 밟는다 — 적응적 사고 시간.
+
+        repetition_penalty > 1이면 이미 등장한 토큰의 logit을 불리하게
+        만든다(CTRL 방식: 양수 logit은 나누고 음수는 곱한다). 작은 모델은
+        같은 말을 한 번 뱉으면 그것이 다시 다음 토큰의 근거가 되는
+        자기강화 루프에 잘 빠지는데, 그 고리를 확률 수준에서 끊는다.
+        1.0이면 완전 무변화 — 기존 체크포인트의 동작 보존."""
         self.eval()
         if n_latent is None:
             n_latent = self.cfg.n_latent
@@ -496,6 +503,10 @@ class GPT(nn.Module):
         pos = 0
         hid_sum, hid_cnt = None, 0
         conf_sum = 0.0
+        # 반복 페널티 대상: 프롬프트 + 지금까지 생성한 토큰. stop 토큰은
+        # 제외한다 — <|end|>를 벌주면 답을 끝맺지 못해 도배가 더 길어진다.
+        # (generate는 B=1 전제 — next_id.item() 등 기존 코드와 같은 가정)
+        seen_ids = set(idx[0].tolist()) - (stop_ids or set())
 
         def step(x_emb):
             """임베딩 (B, T, C)를 통과시키고 마지막 위치의 final_norm 은닉을 반환."""
@@ -540,6 +551,12 @@ class GPT(nn.Module):
             logits = self.lm_head(h_last)
 
             # --- 샘플링 ---
+            # 반복 페널티: 등장했던 토큰의 logit을 항상 불리한 쪽으로만 민다
+            if repetition_penalty != 1.0 and seen_ids:
+                ids_t = torch.tensor(sorted(seen_ids), device=logits.device)
+                row = logits[0, ids_t]
+                logits[0, ids_t] = torch.where(
+                    row > 0, row / repetition_penalty, row * repetition_penalty)
             # temperature: 낮으면 확률 높은 토큰에 집중(안전), 높으면 다양(모험)
             logits = logits / max(temperature, 1e-6)
             probs = F.softmax(logits, dim=-1)
@@ -554,6 +571,7 @@ class GPT(nn.Module):
 
             if stop_ids and next_id.item() in stop_ids:
                 break
+            seen_ids.add(next_id.item())
             yield next_id.item()
             if pos + 1 > self.cfg.max_seq_len:
                 break  # 문맥 길이 초과 — 이 미니 모델의 한계선

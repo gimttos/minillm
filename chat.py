@@ -83,6 +83,9 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--top-p", type=float, default=0.9)
     ap.add_argument("--max-new", type=int, default=256)
+    ap.add_argument("--repetition-penalty", type=float, default=1.2,
+                    help="등장한 토큰의 logit 벌점 (1.0=끔). 작은 모델의 "
+                         "같은 말 도배 루프를 끊는다. 1.1~1.3 권장")
     ap.add_argument("--raw", action="store_true",
                     help="템플릿 없이 입력을 그대로 이어쓰기 (사전학습 모델 확인용)")
     # --- 마음 유사 기제 조절 (기본값은 체크포인트가 스스로 결정) ---
@@ -245,7 +248,8 @@ def main():
             sys.stdout.write(prompt)
             for tid in model.generate(x, args.max_new, args.temperature, args.top_p,
                                       stop_ids={tok.encode_special("<|endoftext|>")},
-                                      n_loop=n_loop, n_latent=0):
+                                      n_loop=n_loop, n_latent=0,
+                                      repetition_penalty=args.repetition_penalty):
                 sys.stdout.write(tok.decode([tid]))
                 sys.stdout.flush()
             print("\n")
@@ -274,7 +278,8 @@ def main():
                                   stop_ids, mood=mood_arg, n_loop=n_loop,
                                   n_latent=n_latent if args.n_latent is None else args.n_latent,
                                   conf_threshold=args.adaptive_latent,
-                                  max_latent=args.max_latent, ws=ws_arg):
+                                  max_latent=args.max_latent, ws=ws_arg,
+                                  repetition_penalty=args.repetition_penalty):
             out_ids.append(tid)
             if tid not in skip_ids:
                 sys.stdout.write(tok.decode([tid]))
