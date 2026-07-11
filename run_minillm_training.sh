@@ -67,6 +67,19 @@ echo "   SFT_ARGS   = $SFT_ARGS"
 echo "   AUTO_STOP  = $POD_AUTO_STOP"
 echo "═══════════════════════════════════════════════════════════════"
 
+# --------------------------- 의존성 자가 복구 -------------------------------
+# RunPod 파드는 /workspace(네트워크 볼륨)만 영구다. pip 패키지는 컨테이너
+# 디스크에 설치돼 파드를 껐다 켜면 사라진다 — 마커 덕에 앞 단계를 건너뛰고
+# 재개하는 실행일수록 import가 처음 터지는 곳이 한참 뒤라서, 매 실행 시작에
+# 확인하고 없으면 조용히 재설치한다. (torch는 PyTorch 이미지에 내장이라 생존)
+if ! python3 -c "import regex, datasets, tqdm, numpy" 2>/dev/null; then
+    echo "📦 의존성 재설치 (파드 재시작으로 컨테이너 디스크 초기화 감지)"
+    pip install -q -U regex datasets tqdm numpy
+fi
+if [[ -n "$HF_TOKEN" ]] && ! python3 -c "import huggingface_hub" 2>/dev/null; then
+    pip install -q -U huggingface_hub
+fi
+
 # --------------------------- Discord 유틸 -----------------------------------
 # jq가 없어도 되도록 python3로 JSON 문자열을 안전하게 이스케이프한다(파이썬은 보장됨).
 _json_escape() { python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'; }
