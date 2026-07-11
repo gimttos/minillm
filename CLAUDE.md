@@ -57,9 +57,26 @@
 | workspace | `sft --workspace-slots` | GWT 지속 작업공간 슬롯, ws_read 전역 방송(제로init)·ws_write EMA 갱신, 턴 내 고정으로 캐시 정합, `chat --workspace-file` 세션 지속 |
 | attn_schema | `sft --attn-schema` | AST 주의 도식 — 레이어별 어텐션 엔트로피를 은닉에서 회귀, 보조손실만(0.05), logits 불변 |
 
+### 런타임 층 (모델 밖 — 핸드오프 워크스트림 G)
+
+학습 파라미터가 붙지 않는 지속 상태·동인·proactive. **정책(임계·쿨다운·DND)은
+`runtime/config.json`에만** 두고 ModelConfig에 넣지 않는다.
+
+| 모듈 | 역할 |
+|---|---|
+| `runtime/drive.py` | DriveState 4종(curiosity/rest/social/maintenance), 벽시계 상승·이벤트 discharge |
+| `runtime/route.py` | drive→mood 가산·curiosity→latent 스텝 (내부 채널만, 우회 금지) |
+| `runtime/state.py` | mood+ws+drive+events 메모리 상주, `--state-file` 저장/복원 |
+| `runtime/proactive.py` | 임계+쿨다운+DND+시간당 상한 → 먼저 말 걸기 판정 |
+| `runtime/sense.py` | 시각·유휴·파일 mtime 등 경량 관측 |
+
+`chat.py --state-file session.pt --proactive --show-drive`. proactive는 지표
+증거가 아님(ELIZA). 단위 테스트: `python -m tests.test_drive`.
+
 보류된 아이디어(다시 제안되면 이 결정을 참고): FiLM 자기 억제(학습 신호 없음),
 레지스터 토큰(mood와 중복). 진짜 읽기-쓰기 메모리 슬롯은 workspace(C1)가
 부분적으로 실현 — 완전한 Block-Recurrent급 read-write 메모리는 다음 세대 후보.
+학습된 `drive_head`는 Phase 4 이후 선택(라벨 데이터 없음 → 지금은 외부 계산).
 
 ## 검증 하네스 (tools/) 와 지표 매핑
 
@@ -69,23 +86,25 @@ eval_state(상태 지속), eval_intervention(개입 인과성), eval_thinking(la
 pause), eval_integration(RPT 전파), eval_schema(AST 정확도). 전부 `--save`로
 `eval_out/` JSON. 공용 로더는 `tools/_common.py`.
 
-## 게이트 순서·불변식 (업그레이드 스펙 v0.1)
+## 게이트 순서·불변식 (핸드오프 v1.0)
 
-- 게이트: (1)속도(fp16자동·토큰예산1B·Muon·base/SFT분리·프리페치) →
-  (2)데이터(나무위키 mix) → (3)재베이스라인(`BASELINE.md`) →
-  (4)마음확장(conf상시·workspace·attn_schema) → (5)검증(D1~D6) → (6)문서.
+- 게이트: (0)토크나이저/ckpt 진단 → (1)속도 → (2)데이터 mix → (3)재베이스라인 →
+  (4)마음확장(conf·workspace·attn_schema) → (5)검증 D1~D6 →
+  (6)런타임 G(drive·state·proactive) → (7)문서.
 - 강화된 불변식: 신규 기제는 **새 토큰을 도입하지 않는다**(전부 벡터/헤드
   수준 → `.bin` 재패킹 불필요). T4는 하드웨어 bf16 없음 → fp16 자동.
+  런타임 정책은 ModelConfig 금지. 마음 기제는 forward 안, drive는 내부 채널로만.
 
 ## 현재 상태와 다음 단계
 
-- 코드는 8개 기제 + 검증 하네스 전부 구현·검증 완료. 옵티마이저 Muon 하이브리드,
-  토큰예산 기반 max_steps, 프리페치 데이터로더 반영. 사전학습은 **아직 시작 전**.
+- 코드는 8개 마음 기제 + 검증 하네스 + **런타임 층(G)** 구현·단위 테스트 완료.
+  옵티마이저 Muon 하이브리드, 토큰예산 기반 max_steps, 프리페치 반영.
+  사전학습은 **아직 시작 전**.
 - 권장 경로: `full`(base, loop off + compile on)로 빠르게 사전학습 →
   SFT에서 마음 기제 조합 부여. loop를 사전학습에 넣으려면 `full-loop`.
 - 다음: Kaggle에서 `download --source mix` → tokenizer(랜덤샘플) → pack →
   `pretrain --preset full --optimizer muon` 1회 완주하고 `BASELINE.md` 채우기
-  → SFT 조합 실험 → D1~D6 검증 → 로컬 대화.
+  → SFT 조합 실험 → D1~D6 검증 → 로컬 `chat.py --state-file --proactive`.
 - 로컬 `tokenizer/tokenizer.json`은 3MB 샘플로 만든 테스트용 (커밋 안 됨).
   Kaggle에서 200MB로 학습한 진짜로 교체 예정.
 

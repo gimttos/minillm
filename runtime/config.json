@@ -1,0 +1,35 @@
+{
+  "drive": {
+    "kinds": ["curiosity", "rest", "social", "maintenance"],
+    "discharge_halflife_sec": {
+      "curiosity": 600,
+      "rest": 3600,
+      "social": 1800,
+      "maintenance": 900
+    },
+    "rise_per_hour": {
+      "curiosity": 0.35,
+      "rest": 0.20,
+      "social": 0.40,
+      "maintenance": 0.15
+    },
+    "mood_scale": 0.3,
+    "curiosity_latent_extra": 2
+  },
+  "proactive": {
+    "thresholds": {
+      "social": 0.7,
+      "curiosity": 0.65
+    },
+    "cooldown_sec": 900,
+    "do_not_disturb": [["23:30", "09:00"]],
+    "max_per_hour": 2
+  },
+  "state": {
+    "idle_tick_sec": 120,
+    "recent_events_maxlen": 64
+  },
+  "runtime": {
+    "lifecycle": "session"
+  }
+}
