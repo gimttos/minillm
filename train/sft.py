@@ -122,7 +122,10 @@ def make_latent_batch(picks, boundaries, ids, mask, a_id, pad_id, device,
         a_pos = np.where(seg_ids == a_id)[0]
         if len(a_pos) == 0:
             continue  # 형식이 깨진 예시는 건너뜀
-        split = int(a_pos[0]) + 1                     # 접두부는 <|assistant|> 포함
+        # 멀티턴이면 assistant가 여러 번 나온다 — 마지막 답변 앞에서 가른다.
+        # "대화 전체를 읽고 → 잠재 사고 → 마지막 답변" 구조가 latent의 의미와
+        # 맞고, 앞선 턴은 접두부(문맥)로 들어간다. 단일턴이면 [0]==[-1].
+        split = int(a_pos[-1]) + 1                    # 접두부는 <|assistant|> 포함
         if split > max_pre:
             # 접두부가 예산을 넘으면 왼쪽(가장 오래된 문맥)을 버린다 —
             # 질문 뒷부분과 <|assistant|>는 보존되므로 학습 신호는 유지된다
