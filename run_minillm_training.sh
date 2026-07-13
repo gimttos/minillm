@@ -157,13 +157,38 @@ $(tail -n 15 "$LOG_FILE" 2>/dev/null)
     fi
     # 성공/실패와 무관하게 요청 시 파드를 멈춘다. GPU 과금이 여기서 끊긴다.
     # (볼륨 보관료는 계속 나가므로, 다 쓴 뒤엔 볼륨도 정리할 것)
-    if [[ "$POD_AUTO_STOP" == "true" && -n "$RUNPOD_POD_ID" ]] && command -v runpodctl >/dev/null 2>&1; then
-        echo "🛑 파드 자동 정지: $RUNPOD_POD_ID"
-        send_discord "🛑 파드를 정지합니다 (GPU 과금 중단)."
-        runpodctl stop pod "$RUNPOD_POD_ID" || true
+    #
+    # 자동 정지가 "조용히" 실패하면 밤새 GPU 과금이 흐른다 — 그게 제일 나쁘다.
+    # 그래서 실패하면 Discord로 크게 알려 사람이 직접 끄게 한다.
+    if [[ "$POD_AUTO_STOP" != "true" ]]; then
+        send_discord "💡 자동 정지가 꺼져 있습니다 — **콘솔에서 파드를 Stop 하세요** (GPU 과금 중)."
+    elif [[ -z "$RUNPOD_POD_ID" ]] || ! command -v runpodctl >/dev/null 2>&1; then
+        send_discord "⚠️ **자동 정지 불가** (runpodctl 또는 POD_ID 없음).
+👉 **콘솔에서 직접 파드를 Stop 하세요 — 안 그러면 GPU 과금이 계속됩니다.**"
+    else
+        echo "🛑 파드 자동 정지 시도: $RUNPOD_POD_ID"
+        if runpodctl stop pod "$RUNPOD_POD_ID"; then
+            send_discord "🛑 파드를 정지했습니다 (GPU 과금 중단)."
+        else
+            send_discord "⚠️ **자동 정지 실패!** (runpodctl 인증 문제일 수 있음)
+👉 **콘솔에서 직접 파드를 Stop 하세요 — 안 그러면 GPU 과금이 계속됩니다.**"
+        fi
     fi
 }
 trap cleanup EXIT INT TERM
+
+# --------------------------- 자동 정지 사전 점검 ----------------------------
+# 9시간 뒤 종료 시점에 "정지 못 함"을 알게 되면 늦다 — 시작할 때 미리 확인한다.
+if [[ "$POD_AUTO_STOP" == "true" ]]; then
+    if ! command -v runpodctl >/dev/null 2>&1; then
+        echo "⚠️  runpodctl 없음 → 자동 정지 불가 (끝나면 콘솔에서 직접 Stop)"
+    elif ! runpodctl get pod >/dev/null 2>&1; then
+        echo "⚠️  runpodctl 인증 안 됨 → 자동 정지 불가"
+        echo "    해결: runpodctl config --apiKey <키>   (RunPod Settings > API Keys)"
+    else
+        echo "✅ 자동 정지 준비됨 (완료 시 파드가 스스로 꺼집니다)"
+    fi
+fi
 
 # ============================== 파이프라인 ==================================
 send_discord "🚀 minillm 시작 (preset $PRETRAIN_PRESET, pod ${RUNPOD_POD_ID:-local})"
