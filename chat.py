@@ -43,11 +43,25 @@ from model.gpt import GPT, ModelConfig
 from tokenizer.bpe import BPETokenizer
 
 
-def build_prompt(tok, history, max_ctx, n_pause=0):
+def build_persona_ids(tok, profiles):
+    """프로필 문장들 -> <|sys|> ... <|end|> 토큰.
+    prepare_sft.encode_persona와 **똑같은 형식**이어야 한다 — 학습 때 본 프리픽스와
+    추론 때 주는 프리픽스가 어긋나면 페르소나가 먹히지 않는다."""
+    if not profiles or not tok.has_special("<|sys|>"):
+        return []
+    return ([tok.encode_special("<|sys|>")] + tok.encode(" ".join(profiles))
+            + [tok.encode_special("<|end|>")])
+
+
+def build_prompt(tok, history, max_ctx, n_pause=0, sys_ids=None):
     """history: [(role, text), ...] -> 토큰 ID 리스트. 뒤에서부터 채워
     문맥을 넘지 않게 오래된 턴을 버린다. 마지막은 <|assistant|>로 끝내고,
-    n_pause > 0이면 SFT 데이터와 똑같이 <|pause|>를 강제로 붙인다."""
+    n_pause > 0이면 SFT 데이터와 똑같이 <|pause|>를 강제로 붙인다.
+
+    sys_ids(페르소나)는 절대 잘리지 않는다 — 대화가 길어져도 정체성은 유지돼야
+    하므로 예산에서 먼저 빼고 남는 것으로 턴을 채운다 (prepare_sft와 같은 규칙)."""
     U, A, END = (tok.encode_special(t) for t in ("<|user|>", "<|assistant|>", "<|end|>"))
+    sys_ids = sys_ids or []
     turns = []
     for role, text in history:
         head = U if role == "user" else A
@@ -56,10 +70,10 @@ def build_prompt(tok, history, max_ctx, n_pause=0):
     if n_pause > 0 and tok.has_special("<|pause|>"):
         ids += [tok.encode_special("<|pause|>")] * n_pause
     for turn in reversed(turns):
-        if len(turn) + len(ids) > max_ctx - 16:
+        if len(sys_ids) + len(turn) + len(ids) > max_ctx - 16:
             break
         ids = turn + ids
-    return ids
+    return sys_ids + ids
 
 
 def _start_input_thread(prompt: str, q: queue.Queue) -> None:
@@ -88,6 +102,12 @@ def main():
                          "같은 말 도배 루프를 끊는다. 1.1~1.3 권장")
     ap.add_argument("--raw", action="store_true",
                     help="템플릿 없이 입력을 그대로 이어쓰기 (사전학습 모델 확인용)")
+    # --- 페르소나: <|sys|> 프리픽스로 정체성을 준다 (SFT가 배운 형식과 동일) ---
+    ap.add_argument("--persona", default="",
+                    help="프로필 문장들. 여러 개는 | 로 구분 "
+                         "(예: \"나는 이자카야 사장이다.|나는 확고한 성격이다.\")")
+    ap.add_argument("--persona-file", default="",
+                    help="프로필을 한 줄에 하나씩 담은 텍스트 파일")
     # --- 마음 유사 기제 조절 (기본값은 체크포인트가 스스로 결정) ---
     ap.add_argument("--n-loop", type=int, default=None,
                     help="loop 반복 횟수 오버라이드 (1=CPU 고속, 학습 최대치 초과는 실험용)")
@@ -134,7 +154,21 @@ def main():
     tok = BPETokenizer.load(args.tokenizer)
     print(f"모델 로드: {args.ckpt} ({model.num_params() / 1e6:.1f}M, {device})")
 
+    # 페르소나 프리픽스 (학습 때와 같은 <|sys|> ... <|end|> 형식)
+    profiles = []
+    if args.persona_file:
+        profiles = [ln.strip() for ln in
+                    Path(args.persona_file).read_text(encoding="utf-8").splitlines()
+                    if ln.strip()]
+    elif args.persona:
+        profiles = [p.strip() for p in args.persona.split("|") if p.strip()]
+    sys_ids = build_persona_ids(tok, profiles)
+    if profiles and not sys_ids:
+        print("주의: 이 토크나이저에 <|sys|>가 없어 페르소나를 주입하지 못했습니다")
+
     features = []
+    if sys_ids:
+        features.append(f"persona {len(profiles)}문장")
     if cfg.n_loop > 1:
         n_loop = args.n_loop if args.n_loop is not None else cfg.n_loop
         if n_loop > cfg.n_loop:
@@ -258,7 +292,8 @@ def main():
     def generate_reply(history, *, is_proactive=False, drive_kind=""):
         """한 턴 생성. drive 라우팅(G2)은 sm 이 있을 때만 mood/latent에 스며든다."""
         nonlocal mood, ws
-        ids = build_prompt(tok, history, cfg.max_seq_len, n_pause=cfg.n_pause)
+        ids = build_prompt(tok, history, cfg.max_seq_len, n_pause=cfg.n_pause,
+                           sys_ids=sys_ids)
         x = torch.tensor([ids], dtype=torch.long, device=device)
 
         n_latent = base_latent
