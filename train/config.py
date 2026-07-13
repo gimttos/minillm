@@ -1,14 +1,32 @@
 """학습 설정 모음.
 
-- tiny : 로컬 CPU에서 파이프라인이 도는지 검증하는 초소형 설정 (몇 분)
-- full : 클라우드 T4 GPU에서 실제로 쓸 ~30M 설정 (base — loop off, compile on)
+- tiny  : 로컬 CPU에서 파이프라인이 도는지 검증하는 초소형 설정 (몇 분)
+- full  : T4 시절의 ~34M 설정 (base — loop off, compile on)
+- large : 4090급 GPU용 ~98M 설정 (아래 설명)
 - full-loop : loop를 사전학습에 넣고 싶을 때의 예전 full (권장 경로 아님)
 
-학습 스크립트는 --preset tiny|full 로 골라 쓴다.
+학습 스크립트는 --preset tiny|full|large 로 골라 쓴다.
 
-권장 경로(§A4): `full`(base) 사전학습 → SFT에서 loop/mood/latent/... 부여.
+권장 경로(§A4): base 사전학습 → SFT에서 loop/mood/latent/... 부여.
 제일 비싼 사전학습 단계에서 loop(1.5배 연산)와 torch.compile 비활성을 걷어내
 속도를 벌고, 마음 기제는 30분~1시간짜리 SFT에서 붙인다.
+
+## 왜 large를 더했나 (34M의 천장)
+
+34M(`full`)은 **Kaggle 무료 T4라는 제약에서 나온 숫자**였다. 4090(24GB)으로
+옮기면서 그 제약이 사라졌고, 실제로 `full`의 사전학습은 4090에서 45분밖에
+걸리지 않았다 — 하드웨어가 놀고 있었다.
+
+그리고 34M은 1B 토큰에서 이미 포화다(Chinchilla 기준 ~700M이면 충분). 즉
+**토큰을 더 넣어도 안 늘고, 병목은 파라미터 수**다. 실전 대화에서 문법은
+완벽한데 의미가 이어지지 않는 것(“수험생인데도 저보다 어린 학생이 있을까요?”)이
+정확히 이 한계다. 마음 기제 자체는 34M에서도 성립했으므로(워크스페이스 인과
+기여 Δ+0.148, 확신도 ECE 0.022), large는 "기제"가 아니라 "말이 통하는가"를
+겨냥한 확장이다.
+
+vocab(16392)과 max_seq_len(512)은 그대로라 **토크나이저·패킹된 .bin을 다시
+만들 필요가 없다**. 다만 체크포인트 shape이 달라지므로 SFT는 새 base에서
+다시 돌려야 한다.
 """
 
 from dataclasses import dataclass, field, asdict
@@ -98,6 +116,32 @@ def get_config(preset: str) -> TrainConfig:
             # Kaggle 12h 세션이 언제 끊길지 모른다 — 자주 저장해 재개 손실을 줄인다.
             eval_interval=100, save_interval=100,
             compile=True,                          # loop off라 그래프가 고정 → compile 가능
+        )
+
+    if preset == "large":
+        # 4090급(24GB) base 사전학습: ~98M. 34M의 천장을 넘기 위한 확장.
+        #
+        # 형태는 GPT-2 small 계열(768 / 12층 / 12헤드, head_dim 64)로 잡았다 —
+        # 검증된 비율이고, head_dim이 full(64)과 같아 RoPE 배선이 그대로다.
+        # ffn_hidden 2048 ≈ 8/3 × 768 (SwiGLU 관례).
+        #
+        # 토큰 예산 2B: Chinchilla 어림(파라미터당 ~20토큰)으로 98M × 20 ≈ 2B.
+        # 유효배치 480×512=245,760 토큰/스텝 -> 약 8,100스텝.
+        # 코퍼스(위키+나무 121만 문서)가 2B에 못 미치면 2~3에폭 반복이 되는데,
+        # 이 규모에서 소수 에폭 반복은 새 데이터와 거의 동등하다고 알려져 있다.
+        #
+        # vocab·max_seq_len이 full과 같아 tokenizer/.bin을 다시 만들 필요가 없다.
+        # 단 체크포인트 shape이 달라지므로 SFT는 이 base에서 다시 돌려야 한다.
+        return TrainConfig(
+            model=ModelConfig(
+                vocab_size=16392,
+                d_model=768, n_layers=12, n_heads=12, ffn_hidden=2048,
+            ),
+            batch_size=24, grad_accum=20,          # 유효 480 유지 (4090 24GB에 여유)
+            target_tokens=2_000_000_000,
+            warmup_steps=500,                      # ~ 스텝의 6%
+            eval_interval=200, save_interval=200,  # 재개 손실을 줄이되 4090이라 덜 잦게
+            compile=True,                          # loop off라 그래프 고정 → compile 가능
         )
 
     if preset == "full-loop":
