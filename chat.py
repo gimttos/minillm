@@ -97,12 +97,23 @@ def build_prompt(tok, history, max_ctx, n_pause=0, sys_ids=None):
     return sys_ids + ids
 
 
+def sanitize(text: str) -> str:
+    """터미널에서 들어온 문자열의 깨진 바이트를 걷어낸다.
+
+    한글을 치다 백스페이스하면 웹 터미널이 3바이트 문자를 중간에서 자른 바이트를
+    보내기도 한다. 파이썬 stdin은 그런 바이트를 surrogateescape로 감싸 문자열에
+    고아 서로게이트(\\udcxx)로 넣어 주는데, 이건 UTF-8로 다시 인코딩할 수 없어
+    tok.encode() 안에서 UnicodeEncodeError로 대화 세션 전체가 죽는다.
+    입력 경계에서 버리는 것이 맞다 — 어차피 복원할 수 없는 바이트다."""
+    return text.encode("utf-8", "ignore").decode("utf-8")
+
+
 def _start_input_thread(prompt: str, q: queue.Queue) -> None:
     """stdin을 별도 스레드에서 읽어 proactive idle 틱과 공존시킨다."""
     def _reader():
         while True:
             try:
-                line = input(prompt)
+                line = sanitize(input(prompt))
             except (EOFError, KeyboardInterrupt):
                 q.put(None)
                 return
@@ -295,7 +306,7 @@ def main():
         print("이어쓰기 모드. 프롬프트를 입력하면 뒤를 이어 씁니다. (Ctrl+C 종료)\n")
         while True:
             try:
-                prompt = input(">>> ")
+                prompt = sanitize(input(">>> "))
             except (EOFError, KeyboardInterrupt):
                 break
             ids = tok.encode(prompt)
