@@ -140,6 +140,10 @@ def main():
                          "(예: \"나는 이자카야 사장이다.|나는 확고한 성격이다.\")")
     ap.add_argument("--persona-file", default="",
                     help="프로필을 한 줄에 하나씩 담은 텍스트 파일")
+    ap.add_argument("--persona-ws", action="store_true",
+                    help="페르소나를 토큰 문맥이 아니라 워크스페이스 슬롯으로 준다 "
+                         "(--persona-mode workspace 로 SFT한 체크포인트용). "
+                         "베낄 텍스트가 없으니 '체화'해야만 한다")
     # --- 마음 유사 기제 조절 (기본값은 체크포인트가 스스로 결정) ---
     ap.add_argument("--n-loop", type=int, default=None,
                     help="loop 반복 횟수 오버라이드 (1=CPU 고속, 학습 최대치 초과는 실험용)")
@@ -186,7 +190,7 @@ def main():
     tok = BPETokenizer.load(args.tokenizer)
     print(f"모델 로드: {args.ckpt} ({model.num_params() / 1e6:.1f}M, {device})")
 
-    # 페르소나 프리픽스 (학습 때와 같은 <|sys|> ... <|end|> 형식)
+    # 페르소나 (학습 때와 같은 <|sys|> ... <|end|> 토큰열)
     profiles = []
     if args.persona_file:
         profiles = [ln.strip() for ln in
@@ -194,12 +198,25 @@ def main():
                     if ln.strip()]
     elif args.persona:
         profiles = [p.strip() for p in args.persona.split("|") if p.strip()]
-    sys_ids = build_persona_ids(tok, profiles)
-    if profiles and not sys_ids:
+    persona_ids = build_persona_ids(tok, profiles)
+    if profiles and not persona_ids:
         print("주의: 이 토크나이저에 <|sys|>가 없어 페르소나를 주입하지 못했습니다")
 
+    # 같은 토큰열을 어느 채널로 넣을지 — 문맥(sys_ids) 또는 워크스페이스 슬롯.
+    sys_ids, persona_ws_vec = persona_ids, None
+    if args.persona_ws and persona_ids:
+        if cfg.workspace_slots == 0:
+            raise SystemExit("--persona-ws 는 워크스페이스가 켜진 체크포인트에서만 동작합니다")
+        sys_ids = []                      # 토큰 문맥에는 넣지 않는다 (베낄 텍스트 없음)
+        with torch.no_grad():
+            p_x = torch.tensor([persona_ids], dtype=torch.long, device=device)
+            h = model.hidden_states(p_x).mean(1)          # (1, C)
+            persona_ws_vec = torch.tanh(model.ws_write(h))  # (1, slots*dim)
+
     features = []
-    if sys_ids:
+    if persona_ws_vec is not None:
+        features.append(f"persona->ws {len(profiles)}문장")
+    elif sys_ids:
         features.append(f"persona {len(profiles)}문장")
     if cfg.n_loop > 1:
         n_loop = args.n_loop if args.n_loop is not None else cfg.n_loop
@@ -338,6 +355,10 @@ def main():
         else:
             mood_arg = mood if (mood is not None and mood.abs().max() > 0) else None
             ws_arg = ws if (ws is not None and ws.abs().max() > 0) else None
+        if persona_ws_vec is not None:
+            # 정체성은 대화로 씻겨나가면 안 된다 — 학습도 매 배치 페르소나에서 새로
+            # 만든 고정 슬롯으로 했으므로, 추론도 같은 조건(고정)이어야 한다.
+            ws_arg = persona_ws_vec
 
         tag = "봇 > " if not is_proactive else f"봇* > "
         sys.stdout.write(tag)
@@ -375,7 +396,8 @@ def main():
                 dims = ", ".join(f"[{i}]={v[i]:+.2f}" for i in top.indices.tolist())
                 print(f"  (기분 ‖{v.norm():.3f}‖ {dims})\n")
 
-        if ws is not None:
+        # persona_ws면 슬롯은 정체성 전용이라 대화 요약으로 갱신하지 않는다.
+        if ws is not None and persona_ws_vec is None:
             ws = model.update_workspace(ws, decay=args.workspace_decay)
             if sm is not None:
                 sm.set_workspace(ws)

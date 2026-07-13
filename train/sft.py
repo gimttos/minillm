@@ -77,6 +77,37 @@ def mood_from_context(model, x, y, m, h=None):
     return torch.tanh(model.mood_read(pool.detach()))   # (B, mood_dim)
 
 
+def make_persona_batch(picks, p_bounds, p_ids, pad_id, device):
+    """예시들의 페르소나 토큰열 -> 오른쪽 패딩 배치 (x, mask)."""
+    segs = [p_ids[p_bounds[i]:p_bounds[i + 1]].astype(np.int64) for i in picks]
+    P = max(max(len(s) for s in segs), 1)
+    x = np.full((len(segs), P), pad_id, dtype=np.int64)
+    m = np.zeros((len(segs), P), dtype=np.float32)
+    for i, s in enumerate(segs):
+        x[i, :len(s)] = s
+        m[i, :len(s)] = 1.0
+    return (torch.from_numpy(x).to(device), torch.from_numpy(m).to(device))
+
+
+def ws_from_persona(model, p_x, p_m):
+    """페르소나 토큰 -> 워크스페이스 슬롯 (persona-in-workspace).
+
+    ws_from_context와 **같은 2-pass 계약**이지만 압축 대상이 다르다: '대화 문맥'이
+    아니라 '나는 누구인가'다. 이 모드에서 페르소나는 토큰 문맥에 없으므로,
+    모델이 자기 정체성을 알 수 있는 **유일한 통로가 이 슬롯**이 된다.
+
+    문맥 방식은 프로필 문장을 그대로 베껴 말하는 앵무새질로 빠지기 쉬운데
+    (실전 관찰: "저는 말동무가 되고 싶어요"를 문장째 복사), 여기서는 베낄 텍스트가
+    아예 없다 — 압축된 상태를 '써먹는' 법을 배우는 수밖에 없다. 그것이 이 실험의
+    가설이다.
+    """
+    with torch.no_grad():
+        h = model.hidden_states(p_x)                    # (B, P, C)
+    sel = p_m.unsqueeze(-1)
+    pool = (h * sel).sum(1) / sel.sum(1).clamp(min=1)   # 패딩 제외 평균
+    return torch.tanh(model.ws_write(pool.detach()))    # (B, slots*dim)
+
+
 def ws_from_context(model, x, y, m, h=None):
     """워크스페이스 2-pass 학습(§C1): 문맥의 은닉 평균을 슬롯 상태로 압축한다.
     mood와 대칭 — 세션엔 멀티턴 상태가 없으니, 문맥을 슬롯으로 압축해 조건화하는
@@ -162,12 +193,17 @@ def make_latent_batch(picks, boundaries, ids, mask, a_id, pad_id, device,
     return to(prefix), to(pad_len), to(suffix_x), to(suffix_y), to(suffix_m), to(first_y)
 
 
-def latent_loss(model, prefix, pad_len, suffix_x, suffix_y, suffix_m, first_y, k):
+def latent_loss(model, prefix, pad_len, suffix_x, suffix_y, suffix_m, first_y, k,
+                ws=None):
     """잠재 사고 경로: 접두부(캐시 유지) -> 잠재 k스텝 -> 답변부(직사각 마스크).
 
     추론(generate)과 똑같은 순서로 처리하되, 접두부와 답변부는 병렬로
     처리해 학습 속도를 지킨다. loss = 답변 첫 토큰(마지막 잠재 스텝이 맞힘)
     + 답변부 각 토큰. attn_mask는 True=참조 허용.
+
+    ws: 워크스페이스 슬롯 — 세 구간(접두/잠재/답변) 전부에 같은 값을 방송해야
+    한다. persona-in-workspace에서는 이것이 모델이 자기 정체성을 아는 유일한
+    통로이므로, 한 구간이라도 빠뜨리면 그 구간은 '내가 누군지 모르는 채' 돈다.
     """
     B, P = prefix.shape
     S = suffix_x.size(1)
@@ -183,7 +219,7 @@ def latent_loss(model, prefix, pad_len, suffix_x, suffix_y, suffix_m, first_y, k
     diag = torch.eye(P, dtype=torch.bool, device=dev)
     pre_mask = pre_mask | diag[None, None, :, :]
     caches = model.new_caches()
-    h = model.run_from_pos(model.tok_emb(prefix), 0, caches, attn_mask=pre_mask)
+    h = model.run_from_pos(model.tok_emb(prefix), 0, caches, attn_mask=pre_mask, ws=ws)
     h_last = h[:, -1, :]                              # <|assistant|> 위치의 은닉
 
     # 2) 잠재 스텝: 은닉을 말 없이 자기 입력으로 k번 되먹인다
@@ -191,7 +227,8 @@ def latent_loss(model, prefix, pad_len, suffix_x, suffix_y, suffix_m, first_y, k
         lat_mask = torch.ones(B, 1, 1, P + t + 1, dtype=torch.bool, device=dev)
         lat_mask[:, 0, 0, :P] = real
         x_lat = model.latent_proj(h_last).unsqueeze(1)
-        h_last = model.run_from_pos(x_lat, P + t, caches, attn_mask=lat_mask)[:, -1, :]
+        h_last = model.run_from_pos(x_lat, P + t, caches, attn_mask=lat_mask,
+                                    ws=ws)[:, -1, :]
 
     # 3) 답변 첫 토큰: 마지막 잠재 스텝의 은닉이 맞혀야 한다 (항상 학습 대상)
     loss_first = F.cross_entropy(model.lm_head(h_last), first_y, reduction="sum")
@@ -202,7 +239,8 @@ def latent_loss(model, prefix, pad_len, suffix_x, suffix_y, suffix_m, first_y, k
     suf_mask = (cols_all[None, None, None, :] <= (P + k + rows_q)[None, None, :, None]) \
         .expand(B, 1, S, P + k + S).clone()
     suf_mask[:, 0, :, :P] &= real[:, None, :]
-    h_suf = model.run_from_pos(model.tok_emb(suffix_x), P + k, caches, attn_mask=suf_mask)
+    h_suf = model.run_from_pos(model.tok_emb(suffix_x), P + k, caches,
+                               attn_mask=suf_mask, ws=ws)
     logits = model.lm_head(h_suf)
     ce = F.cross_entropy(logits.reshape(-1, logits.size(-1)), suffix_y.reshape(-1),
                          ignore_index=-1, reduction="none")
@@ -215,9 +253,12 @@ def latent_loss(model, prefix, pad_len, suffix_x, suffix_y, suffix_m, first_y, k
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def estimate_val(model, val_idx, boundaries, ids, mask, block, batch_size, pad_id,
-                 device, use_mood=False, use_ws=False):
+                 device, use_mood=False, use_ws=False, persona=None):
     """검증 예시 전체의 masked loss 평균. use_mood/use_ws면 2-pass(주입)로 잰다.
-    역피드백은 켜져 있으면(model.cfg.feedback) 항상 반영 — 추론과 같은 조건."""
+    역피드백은 켜져 있으면(model.cfg.feedback) 항상 반영 — 추론과 같은 조건.
+
+    persona=(p_ids, p_boundaries)면 워크스페이스를 페르소나에서 만든다 —
+    학습과 같은 조건이어야 val loss를 문맥 방식과 나란히 놓고 비교할 수 있다."""
     model.eval()
     losses = []
     for i in range(0, len(val_idx), batch_size):
@@ -226,7 +267,11 @@ def estimate_val(model, val_idx, boundaries, ids, mask, block, batch_size, pad_i
         h = (model.hidden_states(x)
              if (use_mood or use_ws or model.cfg.feedback) else None)
         mood = mood_from_context(model, x, y, m, h=h) if use_mood else None
-        ws = ws_from_context(model, x, y, m, h=h) if use_ws else None
+        if persona is not None:
+            p_x, p_m = make_persona_batch(picks, persona[1], persona[0], pad_id, device)
+            ws = ws_from_persona(model, p_x, p_m)
+        else:
+            ws = ws_from_context(model, x, y, m, h=h) if use_ws else None
         fh = h if model.cfg.feedback else None
         _, loss = model(x, y, loss_mask=m, mood=mood, feedback_h=fh, ws=ws)
         losses.append(loss.item())
@@ -338,6 +383,15 @@ def main():
 
     d = np.load(args.data)
     ids, mask, boundaries = d["ids"], d["mask"], d["boundaries"]
+    # persona-in-workspace: prepare_sft --persona-mode workspace 가 넣어 준 배열.
+    # 있으면 워크스페이스 슬롯을 페르소나에서 만든다 (토큰 문맥엔 페르소나가 없다).
+    p_ids = d["p_ids"] if "p_ids" in d.files else None
+    p_bounds = d["p_boundaries"] if "p_boundaries" in d.files else None
+    persona_ws = p_ids is not None and cfg.workspace_slots > 0
+    if p_ids is not None and cfg.workspace_slots == 0:
+        raise SystemExit("이 데이터는 persona-in-workspace용입니다 — "
+                         "--workspace-slots N 을 함께 주세요.")
+
     n_examples = len(boundaries) - 1
     n_val = max(int(n_examples * args.val_frac), 1)
     train_idx = np.arange(0, n_examples - n_val)
@@ -345,6 +399,9 @@ def main():
     steps = int(len(train_idx) * args.epochs / args.batch_size)
     warmup = max(steps // 20, 10)
     print(f"{len(train_idx):,}개 학습 / {n_val:,}개 검증 예시, {steps:,} 스텝 예정")
+    if persona_ws:
+        print(f"persona-in-workspace: 페르소나를 슬롯 {cfg.workspace_slots}개로 압축 "
+              f"(토큰 문맥에는 없음)")
 
     a_id = None
     if args.latent:
@@ -385,10 +442,18 @@ def main():
             path = "latent"
         elif cfg.mood_dim and random.random() < 0.5:
             path = "mood"
-        elif cfg.workspace_slots and random.random() < 0.5:
+        elif cfg.workspace_slots and not persona_ws and random.random() < 0.5:
             path = "ws"
 
         def compute_loss():
+            # persona-in-workspace: 슬롯이 자기 정체성을 담는 유일한 통로이므로
+            # 확률적 경로가 아니라 **항상** 주입한다 (정체성은 매 턴 있는 것이다).
+            p_ws = None
+            if persona_ws:
+                p_x, p_m = make_persona_batch(picks, p_bounds, p_ids,
+                                              pad_id, args.device)
+                p_ws = ws_from_persona(model, p_x, p_m)
+
             if path == "latent":
                 # 역피드백은 이 경로에 얹지 않는다 — 잠재 스텝의 입력 자체가
                 # 이미 전대역 피드백이라 중복이다
@@ -396,7 +461,7 @@ def main():
                                           a_id, pad_id, args.device,
                                           block=cfg.max_seq_len, k=args.latent)
                 if batch is not None:
-                    return latent_loss(model, *batch, k=args.latent)
+                    return latent_loss(model, *batch, k=args.latent, ws=p_ws)
             x, y, m = make_batch(picks, boundaries, ids, mask,
                                  cfg.max_seq_len, pad_id, args.device)
             # 1-pass 은닉은 기분/워크스페이스/역피드백이 공유한다 — 같이 켜도 비용 동일
@@ -405,7 +470,8 @@ def main():
                 with torch.no_grad():
                     h = model.hidden_states(x)
             mood = mood_from_context(model, x, y, m, h=h) if path == "mood" else None
-            ws = ws_from_context(model, x, y, m, h=h) if path == "ws" else None
+            ws = p_ws if persona_ws else (
+                ws_from_context(model, x, y, m, h=h) if path == "ws" else None)
             fh = h if cfg.feedback else None
             _, loss = model(x, y, loss_mask=m, mood=mood, feedback_h=fh, ws=ws)
             return loss
@@ -431,15 +497,24 @@ def main():
             print(f"step {step:>5}/{steps} | loss {loss.item():.3f} | lr {lr:.2e} | {path}{extra}")
 
         if step > 0 and step % args.eval_interval == 0:
+            pers = (p_ids, p_bounds) if persona_ws else None
+            # persona_ws면 페르소나를 넣은 조건이 곧 추론 조건이다 — best 선택도 이걸로.
             vloss = estimate_val(model, val_idx, boundaries, ids, mask,
-                                 cfg.max_seq_len, args.batch_size, pad_id, args.device)
+                                 cfg.max_seq_len, args.batch_size, pad_id, args.device,
+                                 persona=pers)
             line = f"  >> val loss {vloss:.3f} (best {best_val:.3f})"
             if cfg.mood_dim:
                 vm = estimate_val(model, val_idx, boundaries, ids, mask,
                                   cfg.max_seq_len, args.batch_size, pad_id,
-                                  args.device, use_mood=True)
+                                  args.device, use_mood=True, persona=pers)
                 line += f" | mood 주입 시 {vm:.3f}"
-            if cfg.workspace_slots:
+            if persona_ws:
+                # 정체성을 뺀 조건. 슬롯이 실제로 일하고 있다면 loss가 나빠져야 한다
+                # — "페르소나가 없으면 더 못 맞힌다"가 곧 슬롯의 인과적 기여다.
+                v0 = estimate_val(model, val_idx, boundaries, ids, mask,
+                                  cfg.max_seq_len, args.batch_size, pad_id, args.device)
+                line += f" | 페르소나 제거 시 {v0:.3f} (Δ{v0 - vloss:+.3f})"
+            elif cfg.workspace_slots:
                 vw = estimate_val(model, val_idx, boundaries, ids, mask,
                                   cfg.max_seq_len, args.batch_size, pad_id,
                                   args.device, use_ws=True)
