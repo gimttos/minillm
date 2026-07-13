@@ -178,6 +178,19 @@ def main():
     ckpt_path = out_dir / "ckpt.pt"
     if args.resume and ckpt_path.exists():
         ck = torch.load(ckpt_path, map_location=cfg.device)
+        # 프리셋을 바꿔 놓고 --resume 을 주면 다른 아키텍처의 가중치를 얹으려다
+        # 수십 줄짜리 shape 에러가 쏟아진다. 원인을 한 줄로 말해 준다.
+        old = ck.get("model_config", {})
+        new = vars(cfg.model)
+        diff = {k: (old.get(k), new[k]) for k in ("d_model", "n_layers", "n_heads",
+                                                  "ffn_hidden", "vocab_size", "max_seq_len")
+                if k in old and old[k] != new[k]}
+        if diff:
+            raise SystemExit(
+                f"재개 실패: {ckpt_path} 는 다른 아키텍처입니다 — "
+                + ", ".join(f"{k} {o}->{n}" for k, (o, n) in diff.items())
+                + f"\n  이 체크포인트는 다른 프리셋의 것입니다. 새 프리셋으로 처음부터"
+                  f" 학습하려면 --resume 없이 실행하세요 (out_dir={out_dir}).")
         model.load_state_dict(ck["model"])
         optimizer.load_state_dict(ck["optim"])   # 종류 불일치 시 내부에서 새로 시작
         start_step = ck["step"] + 1
