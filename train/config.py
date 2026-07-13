@@ -137,6 +137,10 @@ def get_config(preset: str) -> TrainConfig:
                 vocab_size=16392,
                 d_model=768, n_layers=12, n_heads=12, ffn_hidden=2048,
             ),
+            # 34M(full)과 체크포인트가 섞이지 않게 별도 폴더 — 34M 결과(워크스페이스
+            # 인과 기여·확신도 캘리브레이션)는 보존 가치가 있고, --resume 이 엉뚱한
+            # 아키텍처를 집어 들지도 않는다.
+            out_dir="checkpoints_large",
             batch_size=24, grad_accum=20,          # 유효 480 유지 (4090 24GB에 여유)
             target_tokens=2_000_000_000,
             warmup_steps=500,                      # ~ 스텝의 6%
