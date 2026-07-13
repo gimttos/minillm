@@ -31,6 +31,7 @@ drive 는 mood/latent/workspace 내부 채널로만 작용한다 (우회 래퍼 
 from __future__ import annotations
 
 import argparse
+import codecs
 import queue
 import sys
 import threading
@@ -41,6 +42,26 @@ import torch
 
 from model.gpt import GPT, ModelConfig
 from tokenizer.bpe import BPETokenizer
+
+
+class StreamDecoder:
+    """토큰을 하나씩 받아, **완성된 글자만** 흘려보낸다.
+
+    한글은 UTF-8 3바이트인데 BPE는 바이트 단위라 한 글자가 여러 토큰에 걸친다.
+    그래서 토큰마다 decode(errors="replace")를 하면 잘린 바이트가 그 자리에서
+    U+FFFD(�)로 확정돼 글자가 영구히 깨진다 (모델은 멀쩡히 뱉었는데 화면만 깨짐).
+    증분 디코더는 미완성 바이트열을 물고 있다가 다음 토큰과 합쳐 온전한 글자로
+    내보낸다."""
+
+    def __init__(self, tok):
+        self.tok = tok
+        self._dec = codecs.getincrementaldecoder("utf-8")("replace")
+
+    def push(self, tid: int) -> str:
+        return self._dec.decode(self.tok.vocab[tid])
+
+    def flush(self) -> str:
+        return self._dec.decode(b"", final=True)
 
 
 def build_persona_ids(tok, profiles):
@@ -280,12 +301,14 @@ def main():
             ids = tok.encode(prompt)
             x = torch.tensor([ids], dtype=torch.long, device=device)
             sys.stdout.write(prompt)
+            dec = StreamDecoder(tok)
             for tid in model.generate(x, args.max_new, args.temperature, args.top_p,
                                       stop_ids={tok.encode_special("<|endoftext|>")},
                                       n_loop=n_loop, n_latent=0,
                                       repetition_penalty=args.repetition_penalty):
-                sys.stdout.write(tok.decode([tid]))
+                sys.stdout.write(dec.push(tid))
                 sys.stdout.flush()
+            sys.stdout.write(dec.flush())
             print("\n")
         return
 
@@ -309,6 +332,7 @@ def main():
         sys.stdout.write(tag)
         sys.stdout.flush()
         out_ids = []
+        dec = StreamDecoder(tok)
         for tid in model.generate(x, args.max_new, args.temperature, args.top_p,
                                   stop_ids, mood=mood_arg, n_loop=n_loop,
                                   n_latent=n_latent if args.n_latent is None else args.n_latent,
@@ -317,8 +341,9 @@ def main():
                                   repetition_penalty=args.repetition_penalty):
             out_ids.append(tid)
             if tid not in skip_ids:
-                sys.stdout.write(tok.decode([tid]))
+                sys.stdout.write(dec.push(tid))
                 sys.stdout.flush()
+        sys.stdout.write(dec.flush())
         print("\n")
         text = tok.decode(out_ids)
         history.append(("assistant", text))
