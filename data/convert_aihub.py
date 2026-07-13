@@ -29,6 +29,18 @@ import os
 import zipfile
 
 
+def _load_json_bytes(raw: bytes):
+    """바이트를 JSON으로 읽는다. AI Hub 한국어 원본은 UTF-8이 아니라 BOM 붙은
+    UTF-8이나 CP949(EUC-KR)인 경우가 흔해서, 인코딩을 순서대로 시도한다.
+    전부 실패하면 None (그 파일은 건너뜀)."""
+    for enc in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
+        try:
+            return json.loads(raw.decode(enc))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+    return None
+
+
 def _clean_conversation(obj):
     """원본 대화 dict -> turns 리스트 (또는 버릴 대화면 None)."""
     us = obj.get("utterances") or []
@@ -62,10 +74,12 @@ def _iter_raw(input_dir):
     jsons = glob.glob(os.path.join(input_dir, "**", "*.json"), recursive=True)
     for fp in jsons:
         try:
-            with open(fp, encoding="utf-8") as f:
-                yield os.path.basename(fp)[:-5], json.load(f)
+            with open(fp, "rb") as f:
+                obj = _load_json_bytes(f.read())
         except Exception:
-            continue
+            obj = None
+        if obj is not None:
+            yield os.path.basename(fp)[:-5], obj
     zips = glob.glob(os.path.join(input_dir, "**", "*.zip"), recursive=True)
     for zp in zips:
         try:
@@ -74,10 +88,11 @@ def _iter_raw(input_dir):
                     if not name.endswith(".json"):
                         continue
                     try:
-                        with z.open(name) as f:
-                            yield os.path.basename(name)[:-5], json.load(f)
+                        obj = _load_json_bytes(z.read(name))
                     except Exception:
-                        continue
+                        obj = None
+                    if obj is not None:
+                        yield os.path.basename(name)[:-5], obj
         except Exception:
             continue
 

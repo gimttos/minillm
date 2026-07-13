@@ -70,7 +70,7 @@ def load_conversations(path: str, mirror: bool):
     항상 user로 시작한다.
     """
     convos = []
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8-sig") as f:   # BOM 있어도 안전
         for line in f:
             line = line.strip()
             if not line:
