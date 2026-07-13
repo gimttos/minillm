@@ -162,15 +162,16 @@ $(tail -n 15 "$LOG_FILE" 2>/dev/null)
     # 그래서 실패하면 Discord로 크게 알려 사람이 직접 끄게 한다.
     if [[ "$POD_AUTO_STOP" != "true" ]]; then
         send_discord "💡 자동 정지가 꺼져 있습니다 — **콘솔에서 파드를 Stop 하세요** (GPU 과금 중)."
-    elif [[ -z "$RUNPOD_POD_ID" ]] || ! command -v runpodctl >/dev/null 2>&1; then
-        send_discord "⚠️ **자동 정지 불가** (runpodctl 또는 POD_ID 없음).
+    elif [[ "${AUTO_STOP_READY:-no}" != "yes" || -z "$RUNPOD_POD_ID" ]]; then
+        # 시작 시점의 사전 점검에서 이미 불가로 판정된 경우
+        send_discord "⚠️ **자동 정지 불가** (runpodctl 인증/POD_ID 문제).
 👉 **콘솔에서 직접 파드를 Stop 하세요 — 안 그러면 GPU 과금이 계속됩니다.**"
     else
         echo "🛑 파드 자동 정지 시도: $RUNPOD_POD_ID"
         if runpodctl stop pod "$RUNPOD_POD_ID"; then
             send_discord "🛑 파드를 정지했습니다 (GPU 과금 중단)."
         else
-            send_discord "⚠️ **자동 정지 실패!** (runpodctl 인증 문제일 수 있음)
+            send_discord "⚠️ **자동 정지 실패!**
 👉 **콘솔에서 직접 파드를 Stop 하세요 — 안 그러면 GPU 과금이 계속됩니다.**"
         fi
     fi
@@ -179,14 +180,26 @@ trap cleanup EXIT INT TERM
 
 # --------------------------- 자동 정지 사전 점검 ----------------------------
 # 9시간 뒤 종료 시점에 "정지 못 함"을 알게 되면 늦다 — 시작할 때 미리 확인한다.
+# RUNPOD_API_KEY가 환경에 있으면 여기서 runpodctl에 등록해 준다 (사람이 따로
+# runpodctl config를 칠 필요 없이 export 하나로 끝나게).
+AUTO_STOP_READY="no"
 if [[ "$POD_AUTO_STOP" == "true" ]]; then
     if ! command -v runpodctl >/dev/null 2>&1; then
         echo "⚠️  runpodctl 없음 → 자동 정지 불가 (끝나면 콘솔에서 직접 Stop)"
-    elif ! runpodctl get pod >/dev/null 2>&1; then
-        echo "⚠️  runpodctl 인증 안 됨 → 자동 정지 불가"
-        echo "    해결: runpodctl config --apiKey <키>   (RunPod Settings > API Keys)"
     else
-        echo "✅ 자동 정지 준비됨 (완료 시 파드가 스스로 꺼집니다)"
+        if [[ -n "$RUNPOD_API_KEY" ]] && ! runpodctl get pod >/dev/null 2>&1; then
+            echo "🔑 RUNPOD_API_KEY로 runpodctl 등록 중..."
+            # SSH 키 동기화가 실패해도 config 자체는 저장되므로 실패를 무시한다
+            runpodctl config --apiKey "$RUNPOD_API_KEY" >/dev/null 2>&1 || true
+        fi
+        if runpodctl get pod >/dev/null 2>&1; then
+            AUTO_STOP_READY="yes"
+            echo "✅ 자동 정지 준비됨 (완료 시 파드가 스스로 꺼집니다)"
+        else
+            echo "⚠️  runpodctl 인증 실패 → 자동 정지 불가"
+            echo "    키가 유효한지, 권한이 Read/Write 인지 확인하세요"
+            echo "    (RunPod > Settings > API Keys). 완료 시 콘솔에서 직접 Stop 하면 됩니다."
+        fi
     fi
 fi
 
