@@ -179,9 +179,13 @@ def main():
                     help="멀티턴 대화 JSONL(convert_aihub/convert_persona 출력)")
     ap.add_argument("--mirror", action="store_true",
                     help="멀티턴에서 A/B 역할을 양방향으로 만들어 학습량 2배")
-    ap.add_argument("--no-persona", action="store_true",
-                    help="페르소나 데이터라도 <|sys|> 프리픽스를 넣지 않는다 "
-                         "(persona-in-context 대조군 — workspace 실험의 기준선)")
+    ap.add_argument("--persona-mode", default="context",
+                    choices=["context", "workspace", "none"],
+                    help="페르소나를 어느 채널로 주는가. context=<|sys|> 프리픽스로 "
+                         "토큰 문맥에 / workspace=따로 저장해 GWT 슬롯으로 압축 "
+                         "(토큰 문맥엔 없음) / none=주지 않음(기준선). "
+                         "세 모드가 **같은 토큰열**을 쓰므로 정보량은 동일하고 "
+                         "채널만 다르다 — 그래야 깨끗한 대조 실험이 된다")
     args = ap.parse_args()
 
     tok = BPETokenizer.load(args.tokenizer)
@@ -195,18 +199,24 @@ def main():
     all_ids: list[int] = []
     all_mask: list[int] = []
     boundaries: list[int] = [0]  # 각 예시의 시작 인덱스 (학습 시 예시 단위로 자름)
+    # workspace 모드에서만 채운다: 예시별 페르소나 토큰열 (대화 문맥에는 없다)
+    p_all: list[int] = []
+    p_bounds: list[int] = [0]
 
     if args.conversations:
-        use_persona = not args.no_persona and SYS is not None
-        convos = load_conversations(args.conversations, args.mirror, use_persona)
+        want_persona = args.persona_mode != "none" and SYS is not None
+        to_ws = args.persona_mode == "workspace"
+        convos = load_conversations(args.conversations, args.mirror, want_persona)
         n_with_p = sum(1 for _, p in convos if p)
         print(f"{len(convos):,}개 대화(mirror={args.mirror}) 로드, "
-              f"페르소나 부착 {n_with_p:,}개. 토큰화 중...")
+              f"페르소나 {n_with_p:,}개 -> {args.persona_mode}. 토큰화 중...")
         dropped = 0
         for labeled, profiles in tqdm(convos):
-            sys_ids = encode_persona(profiles, tok, SYS, END) if profiles else []
+            p_ids = encode_persona(profiles, tok, SYS, END) if profiles else []
+            # 같은 토큰열을 context면 문맥 앞에, workspace면 슬롯 압축용으로 따로.
             ex = build_example(labeled, tok, (U, A, END, EOT), pauses,
-                               args.max_tokens, sys_ids=sys_ids)
+                               args.max_tokens,
+                               sys_ids=[] if to_ws else p_ids)
             if ex is None:
                 dropped += 1
                 continue
@@ -214,6 +224,9 @@ def main():
             all_ids.extend(ids)
             all_mask.extend(mask)
             boundaries.append(len(all_ids))
+            if to_ws:
+                p_all.extend(p_ids)
+                p_bounds.append(len(p_all))
         if dropped:
             print(f"  (담지 못한 대화 {dropped:,}개 스킵)")
     else:
@@ -235,13 +248,18 @@ def main():
             boundaries.append(len(all_ids))
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        args.out,
+    out = dict(
         ids=np.array(all_ids, dtype=np.uint16),
         mask=np.array(all_mask, dtype=np.uint8),
         boundaries=np.array(boundaries, dtype=np.int64),
     )
-    print(f"{len(boundaries) - 1:,}개 예시, {len(all_ids):,} 토큰 -> {args.out}")
+    if len(p_bounds) > 1:   # workspace 모드: 예시별 페르소나 토큰열을 함께 저장
+        assert len(p_bounds) == len(boundaries), "페르소나/예시 경계 개수 불일치"
+        out["p_ids"] = np.array(p_all, dtype=np.uint16)
+        out["p_boundaries"] = np.array(p_bounds, dtype=np.int64)
+    np.savez(args.out, **out)
+    extra = f", 페르소나 {len(p_all):,} 토큰(workspace)" if len(p_bounds) > 1 else ""
+    print(f"{len(boundaries) - 1:,}개 예시, {len(all_ids):,} 토큰{extra} -> {args.out}")
 
 
 if __name__ == "__main__":
