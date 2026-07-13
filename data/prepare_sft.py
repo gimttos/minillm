@@ -106,45 +106,8 @@ def load_conversations(path: str, mirror: bool, use_persona: bool = True):
     return convos
 
 
-def build_example(labeled_turns, tok, specials, pauses, max_tokens, sys_ids=None):
-    """[(role, text), ...] -> (ids, mask). 최대 토큰을 넘으면 앞(오래된) 턴부터
-    통째로 버려 최근 문맥을 살린다. 항상 user로 시작하고 assistant로 끝나도록
-    맞춘다. 담을 게 없으면 None.
-
-    sys_ids(페르소나 프리픽스)는 **절대 잘리지 않는다** — 정체성은 대화가 길어져도
-    유지돼야 하므로, 예산에서 먼저 빼고 남는 것으로 턴을 채운다. mask는 0
-    (읽기만 하고 생성하지는 않는다)."""
-    U, A, END, EOT = specials
-    sys_ids = sys_ids or []
-    budget = max_tokens - len(sys_ids)
-    if budget < 8:                                # 페르소나만으로 예산이 찬 경우
-        return None
-
-    blocks = []  # (is_assistant, [토큰...]) — 각 블록은 한 발화(헤더+본문+END)
-    for role, text in labeled_turns:
-        body = tok.encode(text)
-        if role == "assistant":
-            blocks.append((True, [A] + pauses + body + [END]))
-        else:
-            blocks.append((False, [U] + body + [END]))
-
-    # 뒤에서부터 예산 안에 들어오는 만큼만 담는다 (+EOT 자리 1). 최근 대화 우선.
-    picked = []
-    used = 1
-    for is_a, toks in reversed(blocks):
-        if used + len(toks) > budget:
-            break
-        picked.append((is_a, toks))
-        used += len(toks)
-    picked.reverse()
-
-    # user로 시작하도록 앞의 매달린 assistant 블록을 떨군다 (문맥 없는 답변 방지)
-    while picked and picked[0][0]:
-        picked.pop(0)
-    # 최소한 user 1 + assistant 1 이 있어야 학습 신호가 있다
-    if len(picked) < 2 or not any(is_a for is_a, _ in picked):
-        return None
-
+def _emit(picked, sys_ids, pauses, EOT):
+    """고른 블록들 -> (ids, mask). assistant 본문과 말미 <|end|>만 mask 1."""
     ids = list(sys_ids)                           # 페르소나 프리픽스 (mask 0)
     mask = [0] * len(sys_ids)
     for is_a, toks in picked:
@@ -158,6 +121,59 @@ def build_example(labeled_turns, tok, specials, pauses, max_tokens, sys_ids=None
     ids.append(EOT)
     mask.append(0)
     return ids, mask
+
+
+def build_examples(labeled_turns, tok, specials, pauses, max_tokens, sys_ids=None):
+    """[(role, text), ...] -> [(ids, mask), ...] — 예산에 맞는 **창(window)들**.
+
+    왜 하나가 아니라 여럿인가: 예산을 넘는 대화에서 '최근 턴만 남기기'를 하면
+    모든 예시가 **대화의 끝**에서 끝난다. 그러면 마지막 assistant 턴이 언제나
+    작별 인사가 되고, 대화의 도입부는 학습에서 통째로 사라진다 (페르소나 대화는
+    평균 574토큰이라 68%가 예산 초과 — assistant 턴의 26%가 버려졌다). 실제로
+    그 결과 무슨 말을 걸어도 "좋은 하루 되세요"만 하는 붕괴가 일어났다.
+
+    그래서 대화를 예산 크기의 연속된 창으로 나눠 **모든 턴이 적어도 한 창에는
+    학습 대상으로 등장**하게 한다. 각 창은 user로 시작하고 assistant를 포함한다.
+
+    sys_ids(페르소나)는 **모든 창에 붙고 절대 잘리지 않는다** — 정체성은 대화의
+    어느 대목에서도 유지돼야 하므로 예산에서 먼저 뺀다. mask는 0."""
+    U, A, END, EOT = specials
+    sys_ids = sys_ids or []
+    budget = max_tokens - len(sys_ids) - 1        # -1은 EOT 자리
+    if budget < 8:                                # 페르소나만으로 예산이 찬 경우
+        return []
+
+    blocks = []  # (is_assistant, [토큰...]) — 각 블록은 한 발화(헤더+본문+END)
+    for role, text in labeled_turns:
+        body = tok.encode(text)
+        if role == "assistant":
+            blocks.append((True, [A] + pauses + body + [END]))
+        else:
+            blocks.append((False, [U] + body + [END]))
+
+    out, i, n = [], 0, len(blocks)
+    while i < n:
+        # user 블록에서 창을 시작한다 (문맥 없는 답변 방지)
+        while i < n and blocks[i][0]:
+            i += 1
+        if i >= n:
+            break
+        picked, used, j = [], 0, i
+        while j < n and used + len(blocks[j][1]) <= budget:
+            picked.append(blocks[j])
+            used += len(blocks[j][1])
+            j += 1
+        if j == i:            # 발화 하나가 예산보다 큼 — 이 턴은 담을 수 없다
+            i += 1
+            continue
+        # 창은 assistant로 끝나야 학습 신호가 있다 — 꼬리의 매달린 user는 버린다
+        while picked and not picked[-1][0]:
+            picked.pop()
+            j -= 1
+        if len(picked) >= 2 and any(is_a for is_a, _ in picked):
+            out.append(_emit(picked, sys_ids, pauses, EOT))
+        i = max(j, i + 1)     # 다음 창으로 (무한 루프 방지)
+    return out
 
 
 def encode_persona(profiles, tok, sys_id, end_id):
@@ -214,19 +230,19 @@ def main():
         for labeled, profiles in tqdm(convos):
             p_ids = encode_persona(profiles, tok, SYS, END) if profiles else []
             # 같은 토큰열을 context면 문맥 앞에, workspace면 슬롯 압축용으로 따로.
-            ex = build_example(labeled, tok, (U, A, END, EOT), pauses,
-                               args.max_tokens,
-                               sys_ids=[] if to_ws else p_ids)
-            if ex is None:
+            wins = build_examples(labeled, tok, (U, A, END, EOT), pauses,
+                                  args.max_tokens,
+                                  sys_ids=[] if to_ws else p_ids)
+            if not wins:
                 dropped += 1
                 continue
-            ids, mask = ex
-            all_ids.extend(ids)
-            all_mask.extend(mask)
-            boundaries.append(len(all_ids))
-            if to_ws:
-                p_all.extend(p_ids)
-                p_bounds.append(len(p_all))
+            for ids, mask in wins:   # 한 대화가 여러 창을 낼 수 있다
+                all_ids.extend(ids)
+                all_mask.extend(mask)
+                boundaries.append(len(all_ids))
+                if to_ws:            # 페르소나는 모든 창에 붙는다
+                    p_all.extend(p_ids)
+                    p_bounds.append(len(p_all))
         if dropped:
             print(f"  (담지 못한 대화 {dropped:,}개 스킵)")
     else:

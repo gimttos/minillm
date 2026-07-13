@@ -124,8 +124,16 @@ def ws_from_context(model, x, y, m, h=None):
 # 잠재 사고(Coconut): 배치 구성과 loss
 # ---------------------------------------------------------------------------
 def make_latent_batch(picks, boundaries, ids, mask, a_id, pad_id, device,
-                      block=0, k=0):
+                      block=0, k=0, u_id=None):
     """예시들을 <|assistant|> 직후에서 갈라 (접두부, 답변부) 배치로 만든다.
+
+    **어느 assistant 턴에서 가르는가**: 멀티턴이면 assistant가 여러 번 나온다.
+    항상 마지막을 고르면, 예시가 대화의 끝에서 끝나므로 학습 신호가 '대화를
+    맺는 말'에만 쏠린다 — 실제로 그 결과 무슨 말을 걸어도 "좋은 하루 되세요"만
+    하는 붕괴가 일어났다 (latent 경로는 학습의 70%다). 그래서 매번 **무작위로
+    한 턴을 골라** 그 턴의 답변만 학습한다. u_id를 주면 답변부를 그 턴의 끝
+    (다음 <|user|> 직전)까지로 자른다 — 추론과 같은 조건("생각하고 이 턴을
+    답한다")이 되고, 뒤따르는 턴들이 잠재 스텝 없이 딸려 학습되는 불일치도 없앤다.
 
     접두부는 왼쪽 패딩(모든 행의 <|assistant|>가 마지막 열에 오도록),
     답변부는 오른쪽 패딩. 이렇게 정렬해야 잠재 스텝과 답변부가 배치 전체에서
@@ -153,10 +161,17 @@ def make_latent_batch(picks, boundaries, ids, mask, a_id, pad_id, device,
         a_pos = np.where(seg_ids == a_id)[0]
         if len(a_pos) == 0:
             continue  # 형식이 깨진 예시는 건너뜀
-        # 멀티턴이면 assistant가 여러 번 나온다 — 마지막 답변 앞에서 가른다.
-        # "대화 전체를 읽고 → 잠재 사고 → 마지막 답변" 구조가 latent의 의미와
-        # 맞고, 앞선 턴은 접두부(문맥)로 들어간다. 단일턴이면 [0]==[-1].
-        split = int(a_pos[-1]) + 1                    # 접두부는 <|assistant|> 포함
+        # 무작위 턴 선택 (위 독스트링: 마지막 고정은 작별 인사 붕괴를 낳는다)
+        j = int(a_pos[random.randrange(len(a_pos))])
+        split = j + 1                                 # 접두부는 <|assistant|> 포함
+        if u_id is not None:
+            # 그 턴의 답변만 남긴다 — 다음 <|user|> 부터는 잘라낸다
+            nxt = np.where(seg_ids[split:] == u_id)[0]
+            if len(nxt):
+                seg_ids = seg_ids[:split + int(nxt[0])]
+                seg_mask = seg_mask[:split + int(nxt[0])]
+        if len(seg_ids) <= split:
+            continue                                  # 답변이 비면 학습 신호 없음
         if split > max_pre:
             # 접두부가 예산을 넘으면 왼쪽(가장 오래된 문맥)을 버린다 —
             # 질문 뒷부분과 <|assistant|>는 보존되므로 학습 신호는 유지된다
@@ -403,10 +418,12 @@ def main():
         print(f"persona-in-workspace: 페르소나를 슬롯 {cfg.workspace_slots}개로 압축 "
               f"(토큰 문맥에는 없음)")
 
-    a_id = None
+    a_id = u_id = None
     if args.latent:
         from tokenizer.bpe import BPETokenizer
-        a_id = BPETokenizer.load(args.tokenizer).encode_special("<|assistant|>")
+        _tk = BPETokenizer.load(args.tokenizer)
+        a_id = _tk.encode_special("<|assistant|>")
+        u_id = _tk.encode_special("<|user|>")   # 고른 턴의 끝을 찾는 데 쓴다
 
     pad_id = int(ids[0])  # 아무 토큰이나 무방 — target=-1이라 loss에 안 잡힘
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
@@ -459,7 +476,8 @@ def main():
                 # 이미 전대역 피드백이라 중복이다
                 batch = make_latent_batch(picks, boundaries, ids, mask,
                                           a_id, pad_id, args.device,
-                                          block=cfg.max_seq_len, k=args.latent)
+                                          block=cfg.max_seq_len, k=args.latent,
+                                          u_id=u_id)
                 if batch is not None:
                     return latent_loss(model, *batch, k=args.latent, ws=p_ws)
             x, y, m = make_batch(picks, boundaries, ids, mask,
