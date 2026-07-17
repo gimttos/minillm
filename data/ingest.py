@@ -77,10 +77,15 @@ def _collect(obj, field: str, out: list) -> None:
                 _collect(o, field, out)
 
 
+# 폴백에서 이보다 짧은 문자열은 본문이 아니라 식별자·라벨로 본다.
+# (Nemotron-Personas의 uuid 32자, 감정 라벨 "hate" 같은 것들이 본문에 섞이는 것을 막는다)
+_LOOSE_MIN = 40
+
+
 def _loose(obj, out: list) -> None:
-    """폴백: 알려진 키를 하나도 못 찾았을 때 모든 문자열을 긁는다."""
+    """폴백: 알려진 키를 하나도 못 찾았을 때 긴 문자열만 긁는다."""
     if isinstance(obj, str):
-        if obj.strip():
+        if len(obj.strip()) >= _LOOSE_MIN:
             out.append(obj)
     elif isinstance(obj, dict):
         for v in obj.values():
