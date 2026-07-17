@@ -118,6 +118,51 @@ def get_config(preset: str) -> TrainConfig:
             compile=True,                          # loop off라 그래프가 고정 → compile 가능
         )
 
+    if preset in ("xl", "xxl"):
+        # ===== 스케일업 세대 (vocab 32k · context 1024) =====
+        #
+        # 왜 이 세대가 생겼나: 98M/2B에서 문법은 완벽한데 의미가 이어지지 않았다.
+        # "말이 통하는 느낌"의 바닥은 base 규모(파라미터 × 토큰)가 정하고, SFT로는
+        # 그 천장을 못 올린다. 마음 기제는 34M에서 이미 성립했으므로(워크스페이스
+        # 인과 기여 Δ+0.148, ECE 0.022) 이 세대는 "기제"가 아니라 "언어능력"을
+        # 겨냥한다 — 기제를 관찰하려면 그걸 얹을 언어가 먼저 있어야 하니까.
+        #
+        # 이전 세대(full/large)와 달라지는 두 가지, 둘 다 대화 품질에 직결된다:
+        #  - vocab 16392 -> 32768: 한국어에 16k는 작다. 같은 글을 ~15~20% 적은
+        #    토큰으로 담아 학습 시간이 줄고 표현도 좋아진다.
+        #  - max_seq_len 512 -> 1024: 512는 대화 4~6턴이면 찬다. 문맥 길이는
+        #    "대화가 통하는 느낌"에 파라미터만큼 중요하다. RoPE라 테이블만 늘면 된다.
+        #
+        # 이 둘 때문에 **토크나이저와 .bin을 새로 만들어야 한다**(CLAUDE.md의
+        # vocab 16392 규약은 이전 세대 체크포인트용으로 그대로 유효하다 — 옛 모델은
+        # 자기 model_config를 들고 있어 계속 로드된다). 경로를 분리해 공존시킨다.
+        #
+        # 유효 배치는 240 시퀀스 × 1024 = 245,760 토큰/스텝으로 이전과 같게 맞췄다
+        # (LR 스케줄 감각을 재사용하기 위해).
+        big = preset == "xxl"
+        return TrainConfig(
+            model=ModelConfig(
+                vocab_size=32768,
+                max_seq_len=1024,
+                # xl : ~350M (GPT-2 medium 계열, head_dim 64)
+                # xxl: ~1.1B  (head_dim 128)
+                d_model=2048 if big else 1024,
+                n_layers=20 if big else 24,
+                n_heads=16,
+                ffn_hidden=5632 if big else 2816,   # ≈ 8/3 × d_model, 128의 배수
+            ),
+            data_dir="data/bin_32k",                # 32k 토크나이저로 새로 패킹한 것
+            out_dir="checkpoints_xxl" if big else "checkpoints_xl",
+            # 시퀀스가 2배 길어졌으니 마이크로배치를 줄여 메모리를 맞춘다.
+            # (유효 배치 240 시퀀스는 유지 — Muon이 모멘텀 1개만 들어 1B도 24GB에 들어간다)
+            batch_size=4 if big else 12,
+            grad_accum=60 if big else 20,
+            target_tokens=20_000_000_000 if big else 8_000_000_000,  # ≈ 파라미터당 20토큰
+            warmup_steps=2000 if big else 1000,     # ~ 스텝의 3~6%
+            eval_interval=500, save_interval=500,   # 길게 도는 학습이라 재개 손실 관리
+            compile=True,
+        )
+
     if preset == "large":
         # 4090급(24GB) base 사전학습: ~98M. 34M의 천장을 넘기 위한 확장.
         #

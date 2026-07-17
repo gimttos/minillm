@@ -125,7 +125,8 @@ def estimate_loss(model, data, cfg):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--preset", default="full",
-                    choices=["tiny", "tiny-loop", "full", "large", "full-loop"])
+                    choices=["tiny", "tiny-loop", "full", "large", "xl", "xxl",
+                             "full-loop"])
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--init-from", default="", help="이 체크포인트 가중치로 시작(재개 아님)")
     ap.add_argument("--target-tokens", type=int, default=0,
