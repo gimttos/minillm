@@ -46,6 +46,10 @@ POD_AUTO_STOP="${POD_AUTO_STOP:-false}"
 SOURCE="${SOURCE:-mix}"
 MAX_DOCS="${MAX_DOCS:-0}"
 SAMPLE_MB="${SAMPLE_MB:-200}"
+# 모델 vocab과 맞춘다(CLAUDE.md: 16392). train_tokenizer의 기본값은 16384라
+# 명시하지 않으면 8토큰이 비어 그만큼 죽은 파라미터가 된다 — 치명적이진 않지만
+# (토크나이저 ID < 모델 vocab이라 동작은 한다) 맞춰 두는 게 옳다.
+VOCAB_SIZE="${VOCAB_SIZE:-16392}"
 PRETRAIN_PRESET="${PRETRAIN_PRESET:-large}"
 OPTIMIZER="${OPTIMIZER:-muon}"
 TARGET_TOKENS="${TARGET_TOKENS:-0}"
@@ -213,7 +217,7 @@ run_stage "data/raw/.download.done" "1·데이터 다운로드" \
 
 run_stage "tokenizer/.tokenizer.done" "2·토크나이저" \
     python -m tokenizer.train_tokenizer --input data/raw/corpus.txt \
-        --sample-mb "$SAMPLE_MB" --out tokenizer/tokenizer.json
+        --vocab-size "$VOCAB_SIZE" --sample-mb "$SAMPLE_MB" --out tokenizer/tokenizer.json
 
 run_stage "data/bin/.pack.done" "3·패킹" \
     python -m data.pack --input data/raw/corpus.txt \
